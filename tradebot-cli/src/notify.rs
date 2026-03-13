@@ -215,7 +215,7 @@ fn format_subject(config: &AppConfig, task: &TaskConfig, status: &str) -> String
         .and_then(|email| email.subject_prefix.as_deref())
         .map(|prefix| format!("{prefix} "))
         .unwrap_or_default();
-    format!("{prefix}task {} {}", task.name, status)
+    format!("{prefix}{} {}", task.name, status)
 }
 
 fn format_success_body(config: &AppConfig, task: &TaskConfig, result: &ExecutionResult) -> String {
