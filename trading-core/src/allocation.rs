@@ -290,6 +290,7 @@ mod tests {
             name: "close-spy".into(),
             broker: "paper".into(),
             action: crate::models::TaskAction::Place,
+            note: None,
             schedule: None,
             execution: None,
             notify: None,

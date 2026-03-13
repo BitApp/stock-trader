@@ -76,10 +76,11 @@ Task completion emails can be enabled with a task-level recipient list:
 subject_prefix = "[stock-trader]"
 
 [[tasks]]
+note = "Morning rebalance for the core US basket."
 notify = { email = { to = ["ops@example.com"], on = ["success", "failure"] } }
 ```
 
-`on` defaults to `["success"]`. When enabled, both `run` and scheduled `watch` executions send a plain-text email after the task ends.
+`on` defaults to `["success"]`. When enabled, both `run` and scheduled `watch` executions send a plain-text email after the task ends. If a task sets `note`, that text is included in the email body.
 
 You can also render and send a notification template manually with:
 

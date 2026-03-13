@@ -59,6 +59,8 @@ pub struct TaskConfig {
     pub broker: String,
     pub action: TaskAction,
     #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
     pub schedule: Option<TaskScheduleConfig>,
     #[serde(default)]
     pub execution: Option<ExecutionPolicy>,
@@ -582,6 +584,7 @@ mod tests {
             name: "scheduled-rebalance".into(),
             broker: "paper".into(),
             action: TaskAction::Place,
+            note: None,
             schedule: Some(TaskScheduleConfig {
                 date: None,
                 time: "09:30".into(),

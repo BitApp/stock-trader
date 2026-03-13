@@ -27,21 +27,21 @@ pub fn notify_task_success(config: &AppConfig, task: &TaskConfig, result: &Execu
         task,
         NotificationEvent::Success,
         &format_subject(config, task, "completed"),
-        &format_success_body(config, result),
+        &format_success_body(config, task, result),
     );
     if task_result_is_filled(result) {
         dispatch_notification(
             task,
             NotificationEvent::Filled,
             &format_subject(config, task, "filled"),
-            &format_filled_body(config, result),
+            &format_filled_body(config, task, result),
         );
     } else if task_result_is_partially_filled(result) {
         dispatch_notification(
             task,
             NotificationEvent::PartialFilled,
             &format_subject(config, task, "partial_filled"),
-            &format_partial_filled_body(config, result),
+            &format_partial_filled_body(config, task, result),
         );
     }
 }
@@ -66,7 +66,7 @@ pub fn preview_notification(
             let result = sample_result_for_event(task, event)?;
             Ok(NotificationPreview {
                 subject: format_subject(config, task, "completed"),
-                body: format_success_body(config, &result),
+                body: format_success_body(config, task, &result),
             })
         }
         NotificationEvent::Failure => Ok(NotificationPreview {
@@ -81,14 +81,14 @@ pub fn preview_notification(
             let result = sample_result_for_event(task, event)?;
             Ok(NotificationPreview {
                 subject: format_subject(config, task, "filled"),
-                body: format_filled_body(config, &result),
+                body: format_filled_body(config, task, &result),
             })
         }
         NotificationEvent::PartialFilled => {
             let result = sample_result_for_event(task, event)?;
             Ok(NotificationPreview {
                 subject: format_subject(config, task, "partial_filled"),
-                body: format_partial_filled_body(config, &result),
+                body: format_partial_filled_body(config, task, &result),
             })
         }
     }
@@ -218,13 +218,14 @@ fn format_subject(config: &AppConfig, task: &TaskConfig, status: &str) -> String
     format!("{prefix}task {} {}", task.name, status)
 }
 
-fn format_success_body(config: &AppConfig, result: &ExecutionResult) -> String {
+fn format_success_body(config: &AppConfig, task: &TaskConfig, result: &ExecutionResult) -> String {
     let timestamp = timestamp_in_config_timezone(config);
     let payload = serde_json::to_string_pretty(result)
         .unwrap_or_else(|_| "{\"error\":\"failed to serialize execution result\"}".into());
+    let note_section = format_task_note_section(task);
 
     format!(
-        "Task finished successfully.\n\nTime: {timestamp}\nTask: {}\nBroker: {} ({})\nAction: {:?}\nOrders: {}\nCancellations: {}\nWarnings: {}\n\nResult:\n{payload}",
+        "Task finished successfully.\n\nTime: {timestamp}\nTask: {}\nBroker: {} ({})\nAction: {:?}{note_section}\nOrders: {}\nCancellations: {}\nWarnings: {}\n\nResult:\n{payload}",
         result.task_name,
         result.broker_name,
         result.broker_kind,
@@ -237,20 +238,22 @@ fn format_success_body(config: &AppConfig, result: &ExecutionResult) -> String {
 
 fn format_failure_body(config: &AppConfig, task: &TaskConfig, error: &str) -> String {
     let timestamp = timestamp_in_config_timezone(config);
+    let note_section = format_task_note_section(task);
 
     format!(
-        "Task finished with an error.\n\nTime: {timestamp}\nTask: {}\nBroker: {}\nAction: {:?}\nError: {error}",
+        "Task finished with an error.\n\nTime: {timestamp}\nTask: {}\nBroker: {}\nAction: {:?}{note_section}\nError: {error}",
         task.name, task.broker, task.action
     )
 }
 
-fn format_filled_body(config: &AppConfig, result: &ExecutionResult) -> String {
+fn format_filled_body(config: &AppConfig, task: &TaskConfig, result: &ExecutionResult) -> String {
     let timestamp = timestamp_in_config_timezone(config);
     let payload = serde_json::to_string_pretty(result)
         .unwrap_or_else(|_| "{\"error\":\"failed to serialize execution result\"}".into());
+    let note_section = format_task_note_section(task);
 
     format!(
-        "Task finished with all tracked orders filled.\n\nTime: {timestamp}\nTask: {}\nBroker: {} ({})\nAction: {:?}\nOrders: {}\nCancellations: {}\nWarnings: {}\n\nResult:\n{payload}",
+        "Task finished with all tracked orders filled.\n\nTime: {timestamp}\nTask: {}\nBroker: {} ({})\nAction: {:?}{note_section}\nOrders: {}\nCancellations: {}\nWarnings: {}\n\nResult:\n{payload}",
         result.task_name,
         result.broker_name,
         result.broker_kind,
@@ -261,13 +264,18 @@ fn format_filled_body(config: &AppConfig, result: &ExecutionResult) -> String {
     )
 }
 
-fn format_partial_filled_body(config: &AppConfig, result: &ExecutionResult) -> String {
+fn format_partial_filled_body(
+    config: &AppConfig,
+    task: &TaskConfig,
+    result: &ExecutionResult,
+) -> String {
     let timestamp = timestamp_in_config_timezone(config);
     let payload = serde_json::to_string_pretty(result)
         .unwrap_or_else(|_| "{\"error\":\"failed to serialize execution result\"}".into());
+    let note_section = format_task_note_section(task);
 
     format!(
-        "Task finished with partial fills.\n\nTime: {timestamp}\nTask: {}\nBroker: {} ({})\nAction: {:?}\nOrders: {}\nCancellations: {}\nWarnings: {}\n\nResult:\n{payload}",
+        "Task finished with partial fills.\n\nTime: {timestamp}\nTask: {}\nBroker: {} ({})\nAction: {:?}{note_section}\nOrders: {}\nCancellations: {}\nWarnings: {}\n\nResult:\n{payload}",
         result.task_name,
         result.broker_name,
         result.broker_kind,
@@ -276,6 +284,15 @@ fn format_partial_filled_body(config: &AppConfig, result: &ExecutionResult) -> S
         result.cancellations.len(),
         result.warnings.len(),
     )
+}
+
+fn format_task_note_section(task: &TaskConfig) -> String {
+    task.note
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty())
+        .map(|note| format!("\nNote:\n{note}"))
+        .unwrap_or_default()
 }
 
 fn task_result_is_filled(result: &ExecutionResult) -> bool {
@@ -500,6 +517,7 @@ mod tests {
             name: "preview".into(),
             broker: "longbridge".into(),
             action: TaskAction::Place,
+            note: Some("Send a preview notification with task context.".into()),
             schedule: None,
             execution: None,
             notify: None,
@@ -537,6 +555,7 @@ mod tests {
                 .body
                 .contains("Task finished with all tracked orders filled.")
         );
+        assert!(preview.body.contains("Note:\nSend a preview notification with task context."));
         assert!(preview.body.contains("\"status\": \"filled\""));
     }
 }
