@@ -6,12 +6,13 @@ use std::{
     time::Duration,
 };
 
-use chrono::{Datelike, NaiveDate, NaiveTime, Utc, Weekday};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc, Weekday};
 use chrono_tz::Tz;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info, warn};
 use trading_core::{
-    AppConfig, DefaultsConfig, Result, TaskConfig, TaskScheduleConfig, TradeBotError, TradingEngine,
+    AppConfig, DefaultsConfig, Result, ScheduleOverduePolicy, TaskConfig, TaskScheduleConfig,
+    TradeBotError, TradingEngine,
 };
 
 pub fn watch(
@@ -139,18 +140,28 @@ struct WatchState {
     engine: TradingEngine,
     last_fingerprint: String,
     last_attempted: BTreeMap<String, NaiveDate>,
+    task_observed_at: BTreeMap<String, DateTime<Utc>>,
+    last_checked_at: Option<DateTime<Utc>>,
 }
 
 impl WatchState {
     fn load(source: WatchSource) -> Result<Self> {
         let snapshot = source.load_snapshot()?;
+        let observed_at = Utc::now();
 
         Ok(Self {
             engine: crate::build_engine(snapshot.config.clone()),
+            task_observed_at: snapshot
+                .config
+                .tasks
+                .iter()
+                .map(|task| (task.name.clone(), observed_at))
+                .collect(),
             config: snapshot.config,
             source,
             last_fingerprint: snapshot.fingerprint,
             last_attempted: BTreeMap::new(),
+            last_checked_at: None,
         })
     }
 
@@ -171,6 +182,7 @@ impl WatchState {
             return;
         }
 
+        let observed_at = Utc::now();
         self.last_fingerprint = snapshot.fingerprint;
         self.last_attempted.retain(|task_name, _| {
             snapshot
@@ -179,6 +191,18 @@ impl WatchState {
                 .iter()
                 .any(|task| task.name == *task_name)
         });
+        self.task_observed_at.retain(|task_name, _| {
+            snapshot
+                .config
+                .tasks
+                .iter()
+                .any(|task| task.name == *task_name)
+        });
+        for task in &snapshot.config.tasks {
+            self.task_observed_at
+                .entry(task.name.clone())
+                .or_insert(observed_at);
+        }
         self.engine = crate::build_engine(snapshot.config.clone());
         self.config = snapshot.config;
         info!(
@@ -189,11 +213,30 @@ impl WatchState {
     }
 
     fn run_due_tasks(&mut self) {
-        let now = Utc::now().with_timezone(&self.schedule_timezone());
+        let now_utc = Utc::now();
+        let now = now_utc.with_timezone(&self.schedule_timezone());
         let today = now.date_naive();
         for task in &self.config.tasks {
             let last_attempted = self.last_attempted.get(&task.name).copied();
-            if !task_is_due(task, today, now.weekday(), now.time(), last_attempted) {
+            let previous_check = self
+                .last_checked_at
+                .map(|timestamp| timestamp.with_timezone(&self.schedule_timezone()))
+                .map(|timestamp| (timestamp.date_naive(), timestamp.time()));
+            let observed_at = self
+                .task_observed_at
+                .get(&task.name)
+                .copied()
+                .map(|timestamp| timestamp.with_timezone(&self.schedule_timezone()))
+                .map(|timestamp| (timestamp.date_naive(), timestamp.time()));
+            let due_window_start = latest_boundary(previous_check, observed_at);
+            if !task_is_due(
+                task,
+                today,
+                now.weekday(),
+                now.time(),
+                due_window_start,
+                last_attempted,
+            ) {
                 continue;
             }
 
@@ -228,6 +271,7 @@ impl WatchState {
                 }
             }
         }
+        self.last_checked_at = Some(now_utc);
     }
 
     fn schedule_timezone(&self) -> Tz {
@@ -374,13 +418,33 @@ fn task_is_due(
     today: NaiveDate,
     weekday: Weekday,
     now_time: NaiveTime,
+    due_window_start: Option<(NaiveDate, NaiveTime)>,
     last_attempted: Option<NaiveDate>,
 ) -> bool {
     let Some(schedule) = &task.schedule else {
         return false;
     };
 
-    schedule_is_due(schedule, today, weekday, now_time, last_attempted)
+    schedule_is_due(
+        schedule,
+        today,
+        weekday,
+        now_time,
+        due_window_start,
+        last_attempted,
+    )
+}
+
+fn latest_boundary(
+    left: Option<(NaiveDate, NaiveTime)>,
+    right: Option<(NaiveDate, NaiveTime)>,
+) -> Option<(NaiveDate, NaiveTime)> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
 }
 
 fn schedule_is_due(
@@ -388,6 +452,7 @@ fn schedule_is_due(
     today: NaiveDate,
     weekday: Weekday,
     now_time: NaiveTime,
+    due_window_start: Option<(NaiveDate, NaiveTime)>,
     last_attempted: Option<NaiveDate>,
 ) -> bool {
     if last_attempted == Some(today) {
@@ -405,7 +470,20 @@ fn schedule_is_due(
     }
 
     match schedule.parse_time() {
-        Ok(scheduled_time) => now_time >= scheduled_time,
+        Ok(scheduled_time) => {
+            if now_time < scheduled_time {
+                return false;
+            }
+
+            match schedule.overdue_policy {
+                ScheduleOverduePolicy::Run => true,
+                ScheduleOverduePolicy::Skip => {
+                    due_window_start.is_some_and(|(window_date, window_time)| {
+                        window_date == today && window_time <= scheduled_time
+                    })
+                }
+            }
+        }
         Err(_) => false,
     }
 }
@@ -419,7 +497,7 @@ mod tests {
     };
 
     use chrono::{NaiveDate, NaiveTime, Weekday};
-    use trading_core::{ScheduleWeekday, TaskScheduleConfig};
+    use trading_core::{ScheduleOverduePolicy, ScheduleWeekday, TaskScheduleConfig};
 
     use super::{collect_toml_paths, load_config_dir, schedule_is_due};
 
@@ -429,6 +507,7 @@ mod tests {
             time: "09:30".into(),
             weekdays: vec![ScheduleWeekday::Mon, ScheduleWeekday::Tue],
             enabled: true,
+            overdue_policy: ScheduleOverduePolicy::Run,
         }
     }
 
@@ -480,12 +559,14 @@ weight = 1.0
             Weekday::Mon,
             NaiveTime::from_hms_opt(9, 31, 0).unwrap(),
             None,
+            None,
         ));
         assert!(!schedule_is_due(
             &schedule,
             today,
             Weekday::Mon,
             NaiveTime::from_hms_opt(9, 31, 0).unwrap(),
+            None,
             Some(today),
         ));
     }
@@ -501,12 +582,14 @@ weight = 1.0
             Weekday::Sun,
             NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
             None,
+            None,
         ));
         assert!(!schedule_is_due(
             &schedule,
             today,
             Weekday::Mon,
             NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            None,
             None,
         ));
     }
@@ -518,6 +601,7 @@ weight = 1.0
             time: "21:30".into(),
             weekdays: Vec::new(),
             enabled: true,
+            overdue_policy: ScheduleOverduePolicy::Run,
         };
 
         assert!(schedule_is_due(
@@ -526,12 +610,54 @@ weight = 1.0
             Weekday::Fri,
             NaiveTime::from_hms_opt(21, 31, 0).unwrap(),
             None,
+            None,
         ));
         assert!(!schedule_is_due(
             &schedule,
             NaiveDate::from_ymd_opt(2026, 3, 14).unwrap(),
             Weekday::Sat,
             NaiveTime::from_hms_opt(21, 31, 0).unwrap(),
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn skip_overdue_policy_does_not_backfill_missed_runs() {
+        let today = NaiveDate::from_ymd_opt(2026, 3, 16).unwrap();
+        let mut schedule = weekday_only_schedule();
+        schedule.overdue_policy = ScheduleOverduePolicy::Skip;
+
+        assert!(!schedule_is_due(
+            &schedule,
+            today,
+            Weekday::Mon,
+            NaiveTime::from_hms_opt(9, 31, 0).unwrap(),
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn skip_overdue_policy_runs_when_watch_crosses_target_time() {
+        let today = NaiveDate::from_ymd_opt(2026, 3, 16).unwrap();
+        let mut schedule = weekday_only_schedule();
+        schedule.overdue_policy = ScheduleOverduePolicy::Skip;
+
+        assert!(schedule_is_due(
+            &schedule,
+            today,
+            Weekday::Mon,
+            NaiveTime::from_hms_opt(9, 31, 0).unwrap(),
+            Some((today, NaiveTime::from_hms_opt(9, 29, 0).unwrap())),
+            None,
+        ));
+        assert!(!schedule_is_due(
+            &schedule,
+            today,
+            Weekday::Mon,
+            NaiveTime::from_hms_opt(9, 31, 0).unwrap(),
+            Some((today, NaiveTime::from_hms_opt(9, 30, 1).unwrap())),
             None,
         ));
     }

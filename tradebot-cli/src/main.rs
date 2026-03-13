@@ -5,9 +5,11 @@ use std::path::PathBuf;
 
 use broker_ibkr::IbkrBrokerFactory;
 use broker_longbridge::LongbridgeBrokerFactory;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::{EnvFilter, fmt};
-use trading_core::{AppConfig, BrokerRegistry, Result, TradingEngine};
+use trading_core::{
+    AppConfig, BrokerRegistry, NotificationEvent, Result, TradeBotError, TradingEngine,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "tradebot")]
@@ -29,6 +31,16 @@ enum Command {
         #[arg(long)]
         task: String,
     },
+    PreviewNotify {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        task: String,
+        #[arg(long, value_enum)]
+        event: PreviewEvent,
+        #[arg(long)]
+        error: Option<String>,
+    },
     Watch {
         #[arg(long, conflicts_with = "config_dir")]
         config: Option<PathBuf>,
@@ -37,6 +49,25 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         poll_seconds: u64,
     },
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum PreviewEvent {
+    Success,
+    Failure,
+    Filled,
+    PartialFilled,
+}
+
+impl From<PreviewEvent> for NotificationEvent {
+    fn from(value: PreviewEvent) -> Self {
+        match value {
+            PreviewEvent::Success => NotificationEvent::Success,
+            PreviewEvent::Failure => NotificationEvent::Failure,
+            PreviewEvent::Filled => NotificationEvent::Filled,
+            PreviewEvent::PartialFilled => NotificationEvent::PartialFilled,
+        }
+    }
 }
 
 fn main() {
@@ -73,6 +104,20 @@ fn run() -> Result<()> {
                     return Err(err);
                 }
             }
+        }
+        Command::PreviewNotify {
+            config,
+            task,
+            event,
+            error,
+        } => {
+            let loaded = AppConfig::load(&config)?;
+            let task_config = loaded.task(&task)?.clone();
+            let preview =
+                notify::preview_notification(&loaded, &task_config, event.into(), error.as_deref())
+                    .map_err(TradeBotError::Config)?;
+            println!("Subject: {}\n", preview.subject);
+            println!("{}", preview.body);
         }
         Command::Watch {
             config,

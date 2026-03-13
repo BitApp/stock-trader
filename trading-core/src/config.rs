@@ -115,6 +115,8 @@ pub struct TaskScheduleConfig {
     pub weekdays: Vec<ScheduleWeekday>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_overdue_policy")]
+    pub overdue_policy: ScheduleOverduePolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -127,6 +129,13 @@ pub enum ScheduleWeekday {
     Fri,
     Sat,
     Sun,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScheduleOverduePolicy {
+    Run,
+    Skip,
 }
 
 impl AppConfig {
@@ -347,6 +356,10 @@ fn default_enabled() -> bool {
     true
 }
 
+fn default_overdue_policy() -> ScheduleOverduePolicy {
+    ScheduleOverduePolicy::Run
+}
+
 fn default_notification_events() -> Vec<NotificationEvent> {
     vec![NotificationEvent::Success]
 }
@@ -554,7 +567,7 @@ mod tests {
 
     use super::{
         AppConfig, BrokerConfig, DefaultsConfig, EmailNotificationConfig, NotificationEvent,
-        TaskConfig, TaskNotificationConfig, TaskScheduleConfig,
+        ScheduleOverduePolicy, TaskConfig, TaskNotificationConfig, TaskScheduleConfig,
     };
     use crate::{
         errors::TradeBotError,
@@ -574,6 +587,7 @@ mod tests {
                 time: "09:30".into(),
                 weekdays: Vec::new(),
                 enabled: true,
+                overdue_policy: ScheduleOverduePolicy::Run,
             }),
             execution: None,
             notify: None,
@@ -668,6 +682,14 @@ mod tests {
         assert!(
             matches!(err, TradeBotError::Config(message) if message.contains("duplicate weekday"))
         );
+    }
+
+    #[test]
+    fn accepts_skip_overdue_policy() {
+        let mut task = sample_task();
+        task.schedule.as_mut().unwrap().overdue_policy = ScheduleOverduePolicy::Skip;
+
+        assert!(sample_config(task).validate().is_ok());
     }
 
     #[test]

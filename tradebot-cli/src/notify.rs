@@ -4,14 +4,21 @@ use std::env;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_sesv2::types::{Body, Content, Destination, EmailContent, Message};
 use chrono::{Offset, Utc};
+use serde_json::json;
 use tokio::runtime::Builder;
 use tracing::warn;
 use trading_core::{
-    AppConfig, EmailNotificationConfig, ExecutionResult, NotificationEvent, TaskAction, TaskConfig,
+    AppConfig, EmailNotificationConfig, ExecutionResult, NotificationEvent, OrderResult,
+    TaskAction, TaskConfig,
 };
 
 const EMAIL_REGION_ENV: &str = "TRADEBOT_EMAIL_REGION";
 const EMAIL_SENDER_ENV: &str = "TRADEBOT_EMAIL_SENDER";
+
+pub struct NotificationPreview {
+    pub subject: String,
+    pub body: String,
+}
 
 pub fn notify_task_success(config: &AppConfig, task: &TaskConfig, result: &ExecutionResult) {
     dispatch_notification(
@@ -44,6 +51,45 @@ pub fn notify_task_failure(config: &AppConfig, task: &TaskConfig, error: &str) {
         &format_subject(config, task, "failed"),
         &format_failure_body(config, task, error),
     );
+}
+
+pub fn preview_notification(
+    config: &AppConfig,
+    task: &TaskConfig,
+    event: NotificationEvent,
+    failure_error: Option<&str>,
+) -> Result<NotificationPreview, String> {
+    match event {
+        NotificationEvent::Success => {
+            let result = sample_result_for_event(task, event)?;
+            Ok(NotificationPreview {
+                subject: format_subject(config, task, "completed"),
+                body: format_success_body(config, &result),
+            })
+        }
+        NotificationEvent::Failure => Ok(NotificationPreview {
+            subject: format_subject(config, task, "failed"),
+            body: format_failure_body(
+                config,
+                task,
+                failure_error.unwrap_or("preview failure message"),
+            ),
+        }),
+        NotificationEvent::Filled => {
+            let result = sample_result_for_event(task, event)?;
+            Ok(NotificationPreview {
+                subject: format_subject(config, task, "filled"),
+                body: format_filled_body(config, &result),
+            })
+        }
+        NotificationEvent::PartialFilled => {
+            let result = sample_result_for_event(task, event)?;
+            Ok(NotificationPreview {
+                subject: format_subject(config, task, "partial_filled"),
+                body: format_partial_filled_body(config, &result),
+            })
+        }
+    }
 }
 
 fn dispatch_notification(task: &TaskConfig, event: NotificationEvent, subject: &str, body: &str) {
@@ -267,12 +313,81 @@ fn timestamp_in_config_timezone(config: &AppConfig) -> String {
     format!("{} {}", now.format("%Y-%m-%d %H:%M:%S"), now.offset().fix())
 }
 
+fn sample_result_for_event(
+    task: &TaskConfig,
+    event: NotificationEvent,
+) -> Result<ExecutionResult, String> {
+    if task.action != TaskAction::Place {
+        return Err(format!(
+            "notification preview for `{event:?}` only supports place tasks"
+        ));
+    }
+
+    let symbols = if task.symbols.is_empty() {
+        vec!["UNKNOWN".to_string()]
+    } else {
+        task.symbols
+            .iter()
+            .map(|symbol| symbol.instrument.ticker.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let orders = match event {
+        NotificationEvent::Success => symbols
+            .iter()
+            .map(|symbol| sample_order_result(symbol, "submitted", None))
+            .collect(),
+        NotificationEvent::Failure => Vec::new(),
+        NotificationEvent::Filled => symbols
+            .iter()
+            .map(|symbol| sample_order_result(symbol, "filled", Some(1.0)))
+            .collect(),
+        NotificationEvent::PartialFilled => {
+            let mut orders = Vec::new();
+            for (index, symbol) in symbols.iter().enumerate() {
+                let order = if index == 0 {
+                    sample_order_result(symbol, "partially_filled", Some(1.0))
+                } else {
+                    sample_order_result(symbol, "submitted", None)
+                };
+                orders.push(order);
+            }
+            orders
+        }
+    };
+
+    Ok(ExecutionResult {
+        task_name: task.name.clone(),
+        broker_name: task.broker.clone(),
+        broker_kind: "preview".into(),
+        action: task.action,
+        orders,
+        cancellations: Vec::new(),
+        warnings: Vec::new(),
+    })
+}
+
+fn sample_order_result(symbol: &str, status: &str, filled_qty: Option<f64>) -> OrderResult {
+    OrderResult {
+        broker_order_id: format!("preview-broker-{symbol}-{status}"),
+        client_order_id: format!("preview-client-{symbol}-{status}"),
+        status: status.into(),
+        filled_qty,
+        avg_price: None,
+        message: None,
+        raw_metadata: json!({ "symbol": symbol }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use trading_core::{ExecutionResult, OrderResult, TaskAction};
+    use trading_core::{
+        AppConfig, DefaultsConfig, ExecutionResult, InstrumentRef, Market, NotificationEvent,
+        OrderResult, SymbolTarget, TaskAction, TaskConfig,
+    };
 
-    use super::{task_result_is_filled, task_result_is_partially_filled};
+    use super::{preview_notification, task_result_is_filled, task_result_is_partially_filled};
 
     fn sample_order(status: &str, symbol: &str, filled_qty: Option<f64>) -> OrderResult {
         OrderResult {
@@ -332,5 +447,62 @@ mod tests {
         let result = sample_result(vec![sample_order("filled", "SPY", Some(10.0))]);
 
         assert!(!task_result_is_partially_filled(&result));
+    }
+
+    #[test]
+    fn preview_filled_notification_renders_subject_and_body() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                timezone: "UTC".into(),
+                default_tif: trading_core::TimeInForce::Day,
+                email: Some(trading_core::EmailTransportConfig {
+                    subject_prefix: Some("[stock-trader]".into()),
+                }),
+            },
+            brokers: Default::default(),
+            tasks: Vec::new(),
+        };
+        let task = TaskConfig {
+            name: "preview".into(),
+            broker: "longbridge".into(),
+            action: TaskAction::Place,
+            schedule: None,
+            execution: None,
+            notify: None,
+            side: None,
+            pricing: None,
+            risk: None,
+            session: None,
+            shared_budget: None,
+            time_in_force: None,
+            client_tag: None,
+            all_open: false,
+            symbols: vec![SymbolTarget {
+                instrument: InstrumentRef {
+                    ticker: "SPY".into(),
+                    market: Market::Us,
+                    broker_symbol: None,
+                    conid: None,
+                },
+                close_position: false,
+                quantity: Some(1),
+                amount: None,
+                weight: None,
+                limit_price: None,
+                client_order_id: None,
+                broker_options: Default::default(),
+            }],
+        };
+
+        let preview =
+            preview_notification(&config, &task, NotificationEvent::Filled, None).unwrap();
+
+        assert_eq!(preview.subject, "[stock-trader] task preview filled");
+        assert!(
+            preview
+                .body
+                .contains("Task finished with all tracked orders filled.")
+        );
+        assert!(preview.body.contains("\"status\": \"filled\""));
     }
 }

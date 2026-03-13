@@ -51,10 +51,10 @@ Scheduled tasks are declared inline on each task with a local-time `schedule` bl
 timezone = "Asia/Shanghai"
 
 [[tasks]]
-schedule = { time = "09:30", weekdays = ["mon", "tue", "wed", "thu", "fri"] }
+schedule = { time = "09:30", weekdays = ["mon", "tue", "wed", "thu", "fri"], overdue_policy = "run" }
 ```
 
-`defaults.timezone` determines how scheduled task times are interpreted. Edit the config file while `watch` is running and the process will apply the next valid version without a restart. Config reloads are triggered by file-system events; the watch loop timer is only used to wake up and check whether any scheduled task is now due. With `--config-dir`, the watcher loads every `*.toml` in the directory, merges them, and hot-reloads file additions, removals, and edits.
+`defaults.timezone` determines how scheduled task times are interpreted. `schedule.overdue_policy` defaults to `run`, which backfills a task once the watcher notices the scheduled time has already passed. Set `overdue_policy = "skip"` to suppress those catch-up runs and only fire when the watcher actually crosses the scheduled time while active. Edit the config file while `watch` is running and the process will apply the next valid version without a restart. Config reloads are triggered by file-system events; the watch loop timer is only used to wake up and check whether any scheduled task is now due. With `--config-dir`, the watcher loads every `*.toml` in the directory, merges them, and hot-reloads file additions, removals, and edits.
 
 Broker connectivity now comes from environment variables rather than inline broker settings:
 
