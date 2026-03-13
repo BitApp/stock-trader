@@ -40,6 +40,7 @@ enum Command {
 }
 
 fn main() {
+    init_rustls();
     init_logging();
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -92,4 +93,8 @@ fn build_engine(config: AppConfig) -> TradingEngine {
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = fmt().with_env_filter(filter).with_target(false).try_init();
+}
+
+fn init_rustls() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
