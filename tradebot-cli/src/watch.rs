@@ -32,6 +32,7 @@ pub fn watch(
         watch_root = %source.watch_root().display(),
         "watching config for scheduled tasks"
     );
+    state.log_scheduled_tasks("loaded");
 
     loop {
         match rx.recv_timeout(poll_interval) {
@@ -210,6 +211,7 @@ impl WatchState {
             timezone = %self.schedule_timezone(),
             "reloaded config and applied updated schedules"
         );
+        self.log_scheduled_tasks("updated");
     }
 
     fn run_due_tasks(&mut self) {
@@ -279,6 +281,78 @@ impl WatchState {
             .defaults
             .parse_timezone()
             .expect("validated config must contain a valid timezone")
+    }
+
+    fn log_scheduled_tasks(&self, verb: &str) {
+        let scheduled_tasks = scheduled_task_descriptions(&self.config);
+        if scheduled_tasks.is_empty() {
+            info!(
+                source = %self.source.display(),
+                timezone = %self.schedule_timezone(),
+                "no scheduled tasks {verb}"
+            );
+            return;
+        }
+
+        info!(
+            source = %self.source.display(),
+            timezone = %self.schedule_timezone(),
+            count = scheduled_tasks.len(),
+            "scheduled tasks {verb}"
+        );
+        for task in scheduled_tasks {
+            info!(source = %self.source.display(), task = %task, "scheduled task");
+        }
+    }
+}
+
+fn scheduled_task_descriptions(config: &AppConfig) -> Vec<String> {
+    config
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            let schedule = task.schedule.as_ref()?;
+            Some(format!(
+                "{} [{} {:?}] {}",
+                task.name,
+                task.broker,
+                task.action,
+                schedule_description(schedule)
+            ))
+        })
+        .collect()
+}
+
+fn schedule_description(schedule: &TaskScheduleConfig) -> String {
+    let weekday_summary = if schedule.weekdays.is_empty() {
+        "all-days".to_string()
+    } else {
+        schedule
+            .weekdays
+            .iter()
+            .map(|weekday| weekday.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let date_summary = schedule
+        .date
+        .as_deref()
+        .map(|date| format!("date={date}"))
+        .unwrap_or_else(|| "date=any".to_string());
+
+    format!(
+        "{date_summary} time={} weekdays={} enabled={} overdue_policy={}",
+        schedule.time,
+        weekday_summary,
+        schedule.enabled,
+        overdue_policy_as_str(schedule.overdue_policy)
+    )
+}
+
+fn overdue_policy_as_str(policy: ScheduleOverduePolicy) -> &'static str {
+    match policy {
+        ScheduleOverduePolicy::Run => "run",
+        ScheduleOverduePolicy::Skip => "skip",
     }
 }
 
@@ -497,9 +571,12 @@ mod tests {
     };
 
     use chrono::{NaiveDate, NaiveTime, Weekday};
-    use trading_core::{ScheduleOverduePolicy, ScheduleWeekday, TaskScheduleConfig};
+    use trading_core::{AppConfig, ScheduleOverduePolicy, ScheduleWeekday, TaskScheduleConfig};
 
-    use super::{collect_toml_paths, load_config_dir, schedule_is_due};
+    use super::{
+        collect_toml_paths, load_config_dir, schedule_description, schedule_is_due,
+        scheduled_task_descriptions,
+    };
 
     fn weekday_only_schedule() -> TaskScheduleConfig {
         TaskScheduleConfig {
@@ -700,5 +777,66 @@ weight = 1.0
 
         let err = load_config_dir(&dir).unwrap_err();
         assert!(err.to_string().contains("conflicting defaults"));
+    }
+
+    #[test]
+    fn scheduled_task_descriptions_omit_unscheduled_tasks() {
+        let raw = r#"[defaults]
+timezone = "UTC"
+
+[brokers.paper]
+kind = "ibkr"
+
+[[tasks]]
+name = "scheduled-a"
+broker = "paper"
+action = "place"
+schedule = { time = "09:30", weekdays = ["mon"], overdue_policy = "skip" }
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks.symbols]]
+ticker = "AAPL"
+market = "us"
+weight = 1.0
+
+[[tasks]]
+name = "manual-b"
+broker = "paper"
+action = "place"
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks.symbols]]
+ticker = "MSFT"
+market = "us"
+weight = 1.0
+"#;
+        let config = AppConfig::from_toml(raw).unwrap();
+
+        let descriptions = scheduled_task_descriptions(&config);
+        assert_eq!(descriptions.len(), 1);
+        assert!(descriptions[0].contains("scheduled-a"));
+        assert!(descriptions[0].contains("overdue_policy=skip"));
+        assert!(!descriptions[0].contains("manual-b"));
+    }
+
+    #[test]
+    fn schedule_description_includes_date_and_all_days_when_unspecified() {
+        let schedule = TaskScheduleConfig {
+            date: None,
+            time: "21:30".into(),
+            weekdays: Vec::new(),
+            enabled: true,
+            overdue_policy: ScheduleOverduePolicy::Run,
+        };
+
+        let description = schedule_description(&schedule);
+        assert!(description.contains("date=any"));
+        assert!(description.contains("time=21:30"));
+        assert!(description.contains("weekdays=all-days"));
+        assert!(description.contains("overdue_policy=run"));
     }
 }
