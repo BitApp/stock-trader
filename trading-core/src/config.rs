@@ -248,13 +248,19 @@ impl AppConfig {
         for symbol in &task.symbols {
             if symbol.close_position {
                 has_close_position = true;
-                if symbol.quantity.is_some() || symbol.amount.is_some() || symbol.weight.is_some() {
+                if symbol.quantity.is_some()
+                    || symbol.amount.is_some()
+                    || symbol.weight.is_some()
+                    || symbol.min_quantity.is_some()
+                    || symbol.quantity_step.is_some()
+                {
                     return Err(TradeBotError::Validation(format!(
-                        "task `{}` symbol `{}` cannot combine close_position with quantity/amount/weight",
+                        "task `{}` symbol `{}` cannot combine close_position with quantity/amount/weight/min_quantity/quantity_step",
                         task.name, symbol.instrument.ticker
                     )));
                 }
             }
+            validate_symbol_trade_constraints(&task.name, symbol)?;
             if symbol.quantity.is_some() && symbol.amount.is_some() {
                 return Err(TradeBotError::Validation(format!(
                     "task `{}` symbol `{}` cannot set both quantity and amount",
@@ -364,6 +370,53 @@ fn default_overdue_policy() -> ScheduleOverduePolicy {
 
 fn default_notification_events() -> Vec<NotificationEvent> {
     vec![NotificationEvent::Success]
+}
+
+fn validate_symbol_trade_constraints(task_name: &str, symbol: &SymbolTarget) -> Result<()> {
+    if matches!(symbol.min_quantity, Some(0)) {
+        return Err(TradeBotError::Validation(format!(
+            "task `{task_name}` symbol `{}` min_quantity must be positive",
+            symbol.instrument.ticker
+        )));
+    }
+    if matches!(symbol.quantity_step, Some(0)) {
+        return Err(TradeBotError::Validation(format!(
+            "task `{task_name}` symbol `{}` quantity_step must be positive",
+            symbol.instrument.ticker
+        )));
+    }
+
+    if let Some(quantity) = symbol.quantity {
+        let quantity_step = symbol.quantity_step.unwrap_or(1);
+        let min_quantity = align_up_to_step(symbol.min_quantity.unwrap_or(1), quantity_step)?;
+        if quantity < min_quantity {
+            return Err(TradeBotError::Validation(format!(
+                "task `{task_name}` symbol `{}` quantity must be at least {min_quantity}",
+                symbol.instrument.ticker
+            )));
+        }
+        if quantity % quantity_step != 0 {
+            return Err(TradeBotError::Validation(format!(
+                "task `{task_name}` symbol `{}` quantity must align to quantity_step {quantity_step}",
+                symbol.instrument.ticker
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn align_up_to_step(quantity: u64, quantity_step: u64) -> Result<u64> {
+    let remainder = quantity % quantity_step;
+    if remainder == 0 {
+        return Ok(quantity);
+    }
+
+    quantity.checked_add(quantity_step - remainder).ok_or_else(|| {
+        TradeBotError::Validation(
+            "quantity constraint overflow while aligning min_quantity to quantity_step".into(),
+        )
+    })
 }
 
 fn validate_execution_policy(
@@ -613,6 +666,8 @@ mod tests {
                 quantity: None,
                 amount: None,
                 weight: Some(1.0),
+                min_quantity: None,
+                quantity_step: None,
                 limit_price: None,
                 client_order_id: None,
                 broker_options: BTreeMap::new(),
@@ -725,6 +780,32 @@ mod tests {
         let err = sample_config(task).validate().unwrap_err();
         assert!(
             matches!(err, TradeBotError::Validation(message) if message.contains("cannot combine shared_budget with close_position"))
+        );
+    }
+
+    #[test]
+    fn rejects_zero_quantity_step() {
+        let mut task = sample_task();
+        task.symbols[0].quantity_step = Some(0);
+
+        let err = sample_config(task).validate().unwrap_err();
+        assert!(
+            matches!(err, TradeBotError::Validation(message) if message.contains("quantity_step must be positive"))
+        );
+    }
+
+    #[test]
+    fn rejects_explicit_quantity_that_does_not_align_to_step() {
+        let mut task = sample_task();
+        task.shared_budget = None;
+        task.symbols[0].weight = None;
+        task.symbols[0].quantity = Some(150);
+        task.symbols[0].min_quantity = Some(100);
+        task.symbols[0].quantity_step = Some(100);
+
+        let err = sample_config(task).validate().unwrap_err();
+        assert!(
+            matches!(err, TradeBotError::Validation(message) if message.contains("quantity must align to quantity_step 100"))
         );
     }
 

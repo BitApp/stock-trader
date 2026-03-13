@@ -124,6 +124,10 @@ pub struct SymbolTarget {
     #[serde(default)]
     pub weight: Option<f64>,
     #[serde(default)]
+    pub min_quantity: Option<u64>,
+    #[serde(default)]
+    pub quantity_step: Option<u64>,
+    #[serde(default)]
     pub limit_price: Option<f64>,
     #[serde(default)]
     pub client_order_id: Option<String>,

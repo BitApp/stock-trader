@@ -6,9 +6,15 @@ use crate::{
     errors::{Result, TradeBotError},
     models::{
         BrokerOrderRequest, BrokerOrderType, InstrumentRef, OrderSide, PositionSnapshot,
-        PricingSpec, Quote, ResolvedInstrument,
+        PricingSpec, Quote, ResolvedInstrument, SymbolTarget,
     },
 };
+
+#[derive(Clone, Copy)]
+struct QuantityRules {
+    min_tradable_quantity: u64,
+    quantity_step: u64,
+}
 
 pub fn materialize_orders<F, G>(
     task: &TaskConfig,
@@ -60,6 +66,7 @@ where
             &resolved_instrument,
             &mut fetch_quote,
         )?;
+        let quantity_rules = quantity_rules(symbol)?;
 
         let quantity = if symbol.close_position {
             fetch_position_quantity(
@@ -69,9 +76,14 @@ where
                 &mut fetch_position,
             )?
         } else if let Some(quantity) = symbol.quantity {
-            quantity
+            validate_explicit_quantity(quantity, quantity_rules, &symbol.instrument.ticker)?
         } else if let Some(amount) = symbol.amount {
-            amount_to_quantity(amount, reference_price, &symbol.instrument.ticker)?
+            amount_to_quantity(
+                amount,
+                reference_price,
+                quantity_rules,
+                &symbol.instrument.ticker,
+            )?
         } else if let Some(shared_budget) = &task.shared_budget {
             let weight = symbol.weight.ok_or_else(|| {
                 TradeBotError::Validation(format!(
@@ -80,7 +92,12 @@ where
                 ))
             })?;
             let allocation = shared_budget.amount * (weight / weight_total);
-            amount_to_quantity(allocation, reference_price, &symbol.instrument.ticker)?
+            amount_to_quantity(
+                allocation,
+                reference_price,
+                quantity_rules,
+                &symbol.instrument.ticker,
+            )?
         } else {
             return Err(TradeBotError::Validation(format!(
                 "task `{}` symbol `{}` has no allocation",
@@ -198,7 +215,38 @@ fn effective_limit_price(
     }
 }
 
-fn amount_to_quantity(amount: f64, reference_price: f64, ticker: &str) -> Result<u64> {
+fn quantity_rules(symbol: &SymbolTarget) -> Result<QuantityRules> {
+    let quantity_step = symbol.quantity_step.unwrap_or(1);
+    let min_quantity = symbol.min_quantity.unwrap_or(1);
+    let min_tradable_quantity = round_up_to_step(min_quantity, quantity_step, &symbol.instrument.ticker)?;
+    Ok(QuantityRules {
+        min_tradable_quantity,
+        quantity_step,
+    })
+}
+
+fn validate_explicit_quantity(quantity: u64, rules: QuantityRules, ticker: &str) -> Result<u64> {
+    if quantity < rules.min_tradable_quantity {
+        return Err(TradeBotError::Validation(format!(
+            "quantity for `{ticker}` must be at least {}",
+            rules.min_tradable_quantity
+        )));
+    }
+    if quantity % rules.quantity_step != 0 {
+        return Err(TradeBotError::Validation(format!(
+            "quantity for `{ticker}` must align to quantity_step {}",
+            rules.quantity_step
+        )));
+    }
+    Ok(quantity)
+}
+
+fn amount_to_quantity(
+    amount: f64,
+    reference_price: f64,
+    rules: QuantityRules,
+    ticker: &str,
+) -> Result<u64> {
     if amount <= 0.0 {
         return Err(TradeBotError::Validation(format!(
             "allocation amount for `{ticker}` must be positive"
@@ -209,13 +257,36 @@ fn amount_to_quantity(amount: f64, reference_price: f64, ticker: &str) -> Result
             "reference price for `{ticker}` must be positive"
         )));
     }
-    let quantity = (amount / reference_price).floor() as u64;
-    if quantity == 0 {
+    let raw_quantity = (amount / reference_price).floor() as u64;
+    if raw_quantity < rules.min_tradable_quantity {
         return Err(TradeBotError::Validation(format!(
-            "allocation for `{ticker}` rounds down to zero quantity"
+            "allocation for `{ticker}` does not reach minimum tradable quantity {}",
+            rules.min_tradable_quantity
+        )));
+    }
+    let quantity = raw_quantity - (raw_quantity % rules.quantity_step);
+    if quantity < rules.min_tradable_quantity {
+        return Err(TradeBotError::Validation(format!(
+            "allocation for `{ticker}` does not reach minimum tradable quantity {}",
+            rules.min_tradable_quantity
         )));
     }
     Ok(quantity)
+}
+
+fn round_up_to_step(quantity: u64, quantity_step: u64, ticker: &str) -> Result<u64> {
+    let remainder = quantity % quantity_step;
+    if remainder == 0 {
+        return Ok(quantity);
+    }
+
+    quantity
+        .checked_add(quantity_step - remainder)
+        .ok_or_else(|| {
+            TradeBotError::Validation(format!(
+                "trade constraint for `{ticker}` overflows while aligning min_quantity to quantity_step"
+            ))
+        })
 }
 
 fn build_client_order_id(task_name: &str, broker_symbol: &str) -> String {
@@ -315,6 +386,8 @@ mod tests {
                 quantity: None,
                 amount: None,
                 weight: None,
+                min_quantity: None,
+                quantity_step: None,
                 limit_price: None,
                 client_order_id: None,
                 broker_options: std::collections::BTreeMap::new(),
@@ -355,5 +428,136 @@ mod tests {
         assert_eq!(orders[0].quantity, 12);
         assert_eq!(orders[0].order_type, crate::models::BrokerOrderType::Market);
         assert!(orders[0].extended_hours);
+    }
+
+    #[test]
+    fn shared_budget_rounds_down_to_quantity_step() {
+        let task = TaskConfig {
+            name: "hk-basket".into(),
+            broker: "paper".into(),
+            action: crate::models::TaskAction::Place,
+            note: None,
+            schedule: None,
+            execution: None,
+            notify: None,
+            side: Some(OrderSide::Buy),
+            pricing: Some(PricingSpec::Market),
+            risk: None,
+            session: None,
+            shared_budget: Some(crate::models::SharedBudget { amount: 1_750.0 }),
+            time_in_force: None,
+            client_tag: None,
+            all_open: false,
+            symbols: vec![crate::models::SymbolTarget {
+                instrument: InstrumentRef {
+                    ticker: "0700".into(),
+                    market: Market::Hk,
+                    broker_symbol: None,
+                    conid: None,
+                },
+                close_position: false,
+                quantity: None,
+                amount: None,
+                weight: Some(1.0),
+                min_quantity: Some(100),
+                quantity_step: Some(100),
+                limit_price: None,
+                client_order_id: None,
+                broker_options: std::collections::BTreeMap::new(),
+            }],
+        };
+
+        let defaults = DefaultsConfig::default();
+        let orders = materialize_orders(
+            &task,
+            &defaults,
+            |instrument| {
+                Ok(ResolvedInstrument {
+                    ticker: instrument.ticker.clone(),
+                    market: instrument.market,
+                    broker_symbol: "0700.HK".into(),
+                    conid: None,
+                })
+            },
+            |_instrument| unreachable!("position lookup is not used"),
+            |_instrument| {
+                Ok(Quote {
+                    bid: Some(10.0),
+                    ask: Some(10.0),
+                    last: Some(10.0),
+                    currency: None,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].quantity, 100);
+    }
+
+    #[test]
+    fn shared_budget_rejects_allocation_below_minimum_trade_quantity() {
+        let task = TaskConfig {
+            name: "hk-basket".into(),
+            broker: "paper".into(),
+            action: crate::models::TaskAction::Place,
+            note: None,
+            schedule: None,
+            execution: None,
+            notify: None,
+            side: Some(OrderSide::Buy),
+            pricing: Some(PricingSpec::Market),
+            risk: None,
+            session: None,
+            shared_budget: Some(crate::models::SharedBudget { amount: 950.0 }),
+            time_in_force: None,
+            client_tag: None,
+            all_open: false,
+            symbols: vec![crate::models::SymbolTarget {
+                instrument: InstrumentRef {
+                    ticker: "0700".into(),
+                    market: Market::Hk,
+                    broker_symbol: None,
+                    conid: None,
+                },
+                close_position: false,
+                quantity: None,
+                amount: None,
+                weight: Some(1.0),
+                min_quantity: Some(100),
+                quantity_step: Some(100),
+                limit_price: None,
+                client_order_id: None,
+                broker_options: std::collections::BTreeMap::new(),
+            }],
+        };
+
+        let defaults = DefaultsConfig::default();
+        let err = materialize_orders(
+            &task,
+            &defaults,
+            |instrument| {
+                Ok(ResolvedInstrument {
+                    ticker: instrument.ticker.clone(),
+                    market: instrument.market,
+                    broker_symbol: "0700.HK".into(),
+                    conid: None,
+                })
+            },
+            |_instrument| unreachable!("position lookup is not used"),
+            |_instrument| {
+                Ok(Quote {
+                    bid: Some(10.0),
+                    ask: Some(10.0),
+                    last: Some(10.0),
+                    currency: None,
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, TradeBotError::Validation(message) if message.contains("minimum tradable quantity 100"))
+        );
     }
 }

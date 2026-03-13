@@ -540,6 +540,8 @@ mod tests {
                 quantity: Some(1),
                 amount: None,
                 weight: None,
+                min_quantity: None,
+                quantity_step: None,
                 limit_price: None,
                 client_order_id: None,
                 broker_options: Default::default(),
