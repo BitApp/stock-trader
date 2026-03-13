@@ -54,7 +54,7 @@ timezone = "Asia/Shanghai"
 schedule = { time = "09:30", weekdays = ["mon", "tue", "wed", "thu", "fri"] }
 ```
 
-`defaults.timezone` determines how scheduled task times are interpreted. Edit the config file while `watch` is running and the process will apply the next valid version without a restart. With `--config-dir`, the watcher loads every `*.toml` in the directory, merges them, and hot-reloads file additions, removals, and edits.
+`defaults.timezone` determines how scheduled task times are interpreted. Edit the config file while `watch` is running and the process will apply the next valid version without a restart. Config reloads are triggered by file-system events; the watch loop timer is only used to wake up and check whether any scheduled task is now due. With `--config-dir`, the watcher loads every `*.toml` in the directory, merges them, and hot-reloads file additions, removals, and edits.
 
 Broker connectivity now comes from environment variables rather than inline broker settings:
 
@@ -100,6 +100,21 @@ Managed order policies can be attached to `place` tasks. For example, this will 
 pricing = { kind = "counterparty" }
 execution = { kind = "cancel_replace", timeout_seconds = 300, poll_seconds = 5, max_attempts = 3 }
 ```
+
+If you want the default submit-once behavior but prefer explicit config, use:
+
+```toml
+execution = { kind = "one_shot" }
+```
+
+If you want fill tracking without any retry logic, use `track` instead:
+
+```toml
+pricing = { kind = "market" }
+execution = { kind = "track", timeout_seconds = 300, poll_seconds = 30 }
+```
+
+`track` submits once, polls broker order status until the order becomes terminal or the timeout elapses, and never cancels or replaces the order. This is the execution mode to use when you want `filled` or `partial_filled` notifications for a one-shot order.
 
 Extended-hours trading can be enabled per `place` task for brokers that support it:
 

@@ -363,6 +363,22 @@ fn validate_execution_policy(
     }
 
     match execution {
+        ExecutionPolicy::OneShot => {}
+        ExecutionPolicy::Track {
+            timeout_seconds,
+            poll_seconds,
+        } => {
+            if *timeout_seconds == 0 {
+                return Err(TradeBotError::Validation(format!(
+                    "task `{task_name}` execution.track.timeout_seconds must be positive"
+                )));
+            }
+            if *poll_seconds == 0 {
+                return Err(TradeBotError::Validation(format!(
+                    "task `{task_name}` execution.poll_seconds must be positive"
+                )));
+            }
+        }
         ExecutionPolicy::CancelReplace {
             timeout_seconds,
             poll_seconds,
@@ -693,15 +709,33 @@ mod tests {
         task.action = TaskAction::Cancel;
         task.pricing = None;
         task.shared_budget = None;
-        task.execution = Some(ExecutionPolicy::CancelReplace {
-            timeout_seconds: 300,
-            poll_seconds: 5,
-            max_attempts: 2,
-        });
+        task.execution = Some(ExecutionPolicy::OneShot);
 
         let err = sample_config(task).validate().unwrap_err();
         assert!(
             matches!(err, TradeBotError::Validation(message) if message.contains("execution policy is only supported for place action"))
+        );
+    }
+
+    #[test]
+    fn accepts_explicit_one_shot_execution() {
+        let mut task = sample_task();
+        task.execution = Some(ExecutionPolicy::OneShot);
+
+        assert!(sample_config(task).validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_track_execution_without_timeout() {
+        let mut task = sample_task();
+        task.execution = Some(ExecutionPolicy::Track {
+            timeout_seconds: 0,
+            poll_seconds: 5,
+        });
+
+        let err = sample_config(task).validate().unwrap_err();
+        assert!(
+            matches!(err, TradeBotError::Validation(message) if message.contains("execution.track.timeout_seconds must be positive"))
         );
     }
 

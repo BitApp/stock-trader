@@ -69,6 +69,12 @@ pub enum PricingSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExecutionPolicy {
+    OneShot,
+    Track {
+        timeout_seconds: u64,
+        #[serde(default = "default_poll_seconds")]
+        poll_seconds: u64,
+    },
     CancelReplace {
         timeout_seconds: u64,
         #[serde(default = "default_poll_seconds")]

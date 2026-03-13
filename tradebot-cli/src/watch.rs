@@ -2,12 +2,13 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    thread,
+    sync::mpsc::{self, RecvTimeoutError},
     time::Duration,
 };
 
 use chrono::{Datelike, NaiveDate, NaiveTime, Utc, Weekday};
 use chrono_tz::Tz;
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info, warn};
 use trading_core::{
     AppConfig, DefaultsConfig, Result, TaskConfig, TaskScheduleConfig, TradeBotError, TradingEngine,
@@ -21,18 +22,35 @@ pub fn watch(
     let source = WatchSource::from_args(config_path, config_dir)?;
     let poll_interval = Duration::from_secs(poll_seconds.max(1));
     let mut state = WatchState::load(source.clone())?;
+    let (_watcher, rx) = build_watcher(&source)?;
 
     info!(
         source = %source.display(),
         timezone = %state.schedule_timezone(),
         poll_seconds = poll_interval.as_secs(),
+        watch_root = %source.watch_root().display(),
         "watching config for scheduled tasks"
     );
 
     loop {
-        state.reload_if_changed();
+        match rx.recv_timeout(poll_interval) {
+            Ok(Ok(event)) => {
+                if source.should_reload_for_event(&event) {
+                    drain_ready_events(&rx);
+                    state.reload_if_changed();
+                }
+            }
+            Ok(Err(err)) => {
+                warn!(source = %source.display(), error = %err, "config watch event error");
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(TradeBotError::Config(
+                    "file watcher disconnected unexpectedly".into(),
+                ));
+            }
+        }
         state.run_due_tasks();
-        thread::sleep(poll_interval);
     }
 }
 
@@ -74,6 +92,37 @@ impl WatchSource {
         match self {
             Self::File(path) => path.display().to_string(),
             Self::Dir(path) => format!("{}/*.toml", path.display()),
+        }
+    }
+
+    fn watch_root(&self) -> PathBuf {
+        match self {
+            Self::File(path) => path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| path.clone()),
+            Self::Dir(path) => path.clone(),
+        }
+    }
+
+    fn should_reload_for_event(&self, event: &Event) -> bool {
+        match self {
+            Self::File(path) => {
+                let watch_root = path.parent().unwrap_or(path.as_path());
+                event.paths.is_empty()
+                    || event.paths.iter().any(|changed| {
+                        changed == path
+                            || changed == watch_root
+                            || changed.parent() == Some(watch_root)
+                    })
+            }
+            Self::Dir(dir) => {
+                event.paths.is_empty()
+                    || event
+                        .paths
+                        .iter()
+                        .any(|changed| changed.parent() == Some(dir) || changed == dir)
+            }
         }
     }
 }
@@ -219,6 +268,24 @@ fn load_config_dir(dir: &Path) -> Result<ConfigSnapshot> {
         config: merged,
         fingerprint: fingerprint_parts.join("\n--\n"),
     })
+}
+
+fn build_watcher(
+    source: &WatchSource,
+) -> Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)> {
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |result| {
+        let _ = tx.send(result);
+    })
+    .map_err(|err| TradeBotError::Config(format!("failed to start file watcher: {err}")))?;
+    watcher
+        .watch(&source.watch_root(), RecursiveMode::NonRecursive)
+        .map_err(|err| TradeBotError::Config(format!("failed to watch config path: {err}")))?;
+    Ok((watcher, rx))
+}
+
+fn drain_ready_events(rx: &mpsc::Receiver<notify::Result<Event>>) {
+    while rx.try_recv().is_ok() {}
 }
 
 fn collect_toml_paths(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -373,9 +440,6 @@ default_tif = "day"
 
 [brokers.{broker_name}]
 kind = "ibkr"
-base_url = "https://127.0.0.1:5000/v1/api"
-account_id = "DU123456"
-allow_insecure_tls = true
 
 [[tasks]]
 name = "{task_name}"

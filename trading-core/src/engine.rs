@@ -54,7 +54,14 @@ impl TradingEngine {
 
         match task.action {
             TaskAction::Place => {
-                if let Some(execution) = &task.execution {
+                if matches!(
+                    task.execution,
+                    Some(ExecutionPolicy::Track { .. } | ExecutionPolicy::CancelReplace { .. })
+                ) {
+                    let execution = task
+                        .execution
+                        .as_ref()
+                        .expect("matched Some execution policy");
                     self.run_managed_place_task(
                         task,
                         broker.as_ref(),
@@ -139,8 +146,10 @@ impl TradingEngine {
         if placed_orders.iter().any(|order| {
             matches!(
                 execution,
-                ExecutionPolicy::CancelReplace { .. }
-                    if order.status == "timeout_unfilled" || order.status == "cancelled_for_retry"
+                ExecutionPolicy::Track { .. } | ExecutionPolicy::CancelReplace { .. }
+                    if order.status == "tracking_timeout"
+                        || order.status == "timeout_unfilled"
+                        || order.status == "cancelled_for_retry"
             )
         }) {
             warnings.push(format!(
@@ -168,14 +177,38 @@ impl TradingEngine {
         broker: &dyn crate::Broker,
         execution: &ExecutionPolicy,
     ) -> Result<(Vec<OrderResult>, Vec<CancelResult>)> {
-        let (timeout_seconds, poll_seconds, max_attempts) = match execution {
+        match execution {
+            ExecutionPolicy::OneShot => unreachable!("one_shot does not use managed execution"),
+            ExecutionPolicy::Track {
+                timeout_seconds,
+                poll_seconds,
+            } => self.track_single_order(seed_order, broker, *timeout_seconds, *poll_seconds),
             ExecutionPolicy::CancelReplace {
                 timeout_seconds,
                 poll_seconds,
                 max_attempts,
-            } => (*timeout_seconds, *poll_seconds, *max_attempts),
-        };
+            } => self.execute_cancel_replace_policy(
+                task,
+                symbol,
+                seed_order,
+                broker,
+                *timeout_seconds,
+                *poll_seconds,
+                *max_attempts,
+            ),
+        }
+    }
 
+    fn execute_cancel_replace_policy(
+        &self,
+        task: &crate::config::TaskConfig,
+        symbol: &SymbolTarget,
+        seed_order: &crate::BrokerOrderRequest,
+        broker: &dyn crate::Broker,
+        timeout_seconds: u64,
+        poll_seconds: u64,
+        max_attempts: u32,
+    ) -> Result<(Vec<OrderResult>, Vec<CancelResult>)> {
         let mut remaining_quantity = seed_order.quantity;
         let mut orders = Vec::new();
         let mut cancellations = Vec::new();
@@ -228,6 +261,34 @@ impl TradingEngine {
         }
 
         Ok((orders, cancellations))
+    }
+
+    fn track_single_order(
+        &self,
+        seed_order: &crate::BrokerOrderRequest,
+        broker: &dyn crate::Broker,
+        timeout_seconds: u64,
+        poll_seconds: u64,
+    ) -> Result<(Vec<OrderResult>, Vec<CancelResult>)> {
+        let mut placed = broker
+            .place_orders(std::slice::from_ref(seed_order))?
+            .into_iter()
+            .next()
+            .expect("broker returned empty order list for single order request");
+
+        let snapshot = self.wait_for_order(
+            broker,
+            &placed.broker_order_id,
+            timeout_seconds,
+            poll_seconds,
+        )?;
+        apply_status_snapshot(&mut placed, &snapshot);
+
+        if !snapshot.is_final && snapshot.is_active {
+            placed.status = "tracking_timeout".into();
+        }
+
+        Ok((vec![placed], Vec::new()))
     }
 
     fn retry_order_request(
@@ -751,5 +812,205 @@ mod tests {
         assert_eq!(result.orders[1].status, "filled");
         assert_eq!(state.placed_quantities, vec![10, 10]);
         assert_eq!(state.cancelled_order_ids, vec!["order-1".to_string()]);
+    }
+
+    struct TrackFactory;
+
+    impl BrokerFactory for TrackFactory {
+        fn kind(&self) -> &'static str {
+            "track_mock"
+        }
+
+        fn build(&self, broker_name: &str, _config: &BrokerConfig) -> Result<Box<dyn Broker>> {
+            Ok(Box::new(TrackBroker {
+                name: broker_name.to_string(),
+            }))
+        }
+    }
+
+    struct TrackBroker {
+        name: String,
+    }
+
+    impl Broker for TrackBroker {
+        fn broker_name(&self) -> &str {
+            &self.name
+        }
+
+        fn broker_kind(&self) -> &str {
+            "track_mock"
+        }
+
+        fn health_check(&self) -> Result<BrokerHealth> {
+            Ok(BrokerHealth {
+                reachable: true,
+                authenticated: true,
+                brokerage_session: true,
+                message: None,
+            })
+        }
+
+        fn resolve_instrument(&self, instrument: &InstrumentRef) -> Result<ResolvedInstrument> {
+            Ok(ResolvedInstrument {
+                ticker: instrument.ticker.clone(),
+                market: instrument.market,
+                broker_symbol: format!("{}.US", instrument.ticker),
+                conid: None,
+            })
+        }
+
+        fn fetch_position(&self, instrument: &ResolvedInstrument) -> Result<PositionSnapshot> {
+            Ok(PositionSnapshot {
+                instrument: instrument.clone(),
+                quantity: 100,
+                available_quantity: 100,
+            })
+        }
+
+        fn fetch_quote(&self, _instrument: &ResolvedInstrument) -> Result<Quote> {
+            Ok(Quote {
+                bid: Some(99.0),
+                ask: Some(100.0),
+                last: Some(99.5),
+                currency: Some("USD".into()),
+            })
+        }
+
+        fn place_orders(&self, orders: &[BrokerOrderRequest]) -> Result<Vec<OrderResult>> {
+            Ok(orders
+                .iter()
+                .map(|order| OrderResult {
+                    broker_order_id: format!("track-{}", order.client_order_id),
+                    client_order_id: order.client_order_id.clone(),
+                    status: "submitted_market".into(),
+                    filled_qty: None,
+                    avg_price: None,
+                    message: None,
+                    raw_metadata: json!({ "symbol": order.instrument.broker_symbol }),
+                })
+                .collect())
+        }
+
+        fn cancel_orders(&self, _request: &CancelRequest) -> Result<Vec<CancelResult>> {
+            Ok(Vec::new())
+        }
+
+        fn get_order_status(&self, broker_order_id: &str) -> Result<OrderStatusSnapshot> {
+            Ok(OrderStatusSnapshot {
+                broker_order_id: broker_order_id.to_string(),
+                status: "filled".into(),
+                filled_qty: Some(10.0),
+                remaining_qty: Some(0.0),
+                avg_price: Some(99.0),
+                message: None,
+                is_active: false,
+                is_final: true,
+                raw_metadata: json!({ "symbol": "AAPL.US" }),
+            })
+        }
+    }
+
+    #[test]
+    fn run_place_task_tracks_without_retry() {
+        let mut registry = BrokerRegistry::new();
+        registry.register(TrackFactory);
+
+        let task = TaskConfig {
+            name: "track".into(),
+            broker: "paper".into(),
+            action: TaskAction::Place,
+            schedule: None,
+            execution: Some(ExecutionPolicy::Track {
+                timeout_seconds: 30,
+                poll_seconds: 1,
+            }),
+            notify: None,
+            side: Some(OrderSide::Sell),
+            pricing: Some(PricingSpec::Market),
+            risk: None,
+            session: None,
+            shared_budget: None,
+            time_in_force: Some(TimeInForce::Day),
+            client_tag: Some("track-run".into()),
+            all_open: false,
+            symbols: vec![SymbolTarget {
+                instrument: InstrumentRef {
+                    ticker: "AAPL".into(),
+                    market: Market::Us,
+                    broker_symbol: None,
+                    conid: None,
+                },
+                close_position: false,
+                quantity: Some(10),
+                amount: None,
+                weight: None,
+                limit_price: None,
+                client_order_id: None,
+                broker_options: BTreeMap::new(),
+            }],
+        };
+
+        let config = AppConfig {
+            defaults: DefaultsConfig::default(),
+            brokers: BTreeMap::from([(
+                "paper".into(),
+                BrokerConfig {
+                    kind: "track_mock".into(),
+                    settings: BTreeMap::new(),
+                },
+            )]),
+            tasks: vec![task],
+        };
+
+        let result = TradingEngine::new(config, registry)
+            .run_task("track")
+            .unwrap();
+
+        assert_eq!(result.orders.len(), 1);
+        assert_eq!(result.orders[0].status, "filled");
+        assert!(result.cancellations.is_empty());
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn run_place_task_explicit_one_shot_matches_plain_submit() {
+        let task = TaskConfig {
+            name: "one-shot".into(),
+            broker: "paper".into(),
+            action: TaskAction::Place,
+            schedule: None,
+            execution: Some(ExecutionPolicy::OneShot),
+            notify: None,
+            side: Some(OrderSide::Buy),
+            pricing: Some(PricingSpec::Counterparty),
+            risk: None,
+            session: None,
+            shared_budget: None,
+            time_in_force: Some(TimeInForce::Day),
+            client_tag: Some("one-shot-run".into()),
+            all_open: false,
+            symbols: vec![SymbolTarget {
+                instrument: InstrumentRef {
+                    ticker: "AAPL".into(),
+                    market: Market::Us,
+                    broker_symbol: None,
+                    conid: None,
+                },
+                close_position: false,
+                quantity: Some(10),
+                amount: None,
+                weight: None,
+                limit_price: None,
+                client_order_id: None,
+                broker_options: BTreeMap::new(),
+            }],
+        };
+
+        let result = test_engine(task).run_task("one-shot").unwrap();
+
+        assert_eq!(result.orders.len(), 1);
+        assert_eq!(result.orders[0].status, "submitted_limit");
+        assert!(result.cancellations.is_empty());
+        assert!(result.warnings.is_empty());
     }
 }
