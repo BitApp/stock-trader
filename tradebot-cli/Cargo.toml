@@ -1,0 +1,15 @@
+[package]
+name = "tradebot-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+broker-ibkr = { path = "../broker-ibkr" }
+broker-longbridge = { path = "../broker-longbridge" }
+clap.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+trading-core = { path = "../trading-core" }

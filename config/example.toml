@@ -1,0 +1,69 @@
+[defaults]
+timezone = "Asia/Shanghai"
+default_tif = "day"
+
+[brokers.longbridge]
+kind = "longbridge"
+app_key_env = "LONGBRIDGE_APP_KEY"
+app_secret_env = "LONGBRIDGE_APP_SECRET"
+access_token_env = "LONGBRIDGE_ACCESS_TOKEN"
+
+[brokers.ibkr]
+kind = "ibkr"
+base_url = "https://127.0.0.1:5000/v1/api"
+account_id = "DU123456"
+allow_insecure_tls = true
+auto_confirm_replies = true
+
+[[tasks]]
+name = "ibkr_us_rebalance"
+broker = "ibkr"
+action = "place"
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 10000.0 }
+risk = { allow_margin = true }
+client_tag = "pm2-us-rebalance"
+
+[[tasks.symbols]]
+ticker = "AAPL"
+market = "us"
+conid = "265598"
+weight = 0.6
+
+[[tasks.symbols]]
+ticker = "MSFT"
+market = "us"
+conid = "272093"
+weight = 0.4
+
+[[tasks]]
+name = "ibkr_cancel_us_rebalance"
+broker = "ibkr"
+action = "cancel"
+side = "buy"
+client_tag = "pm2-us-rebalance"
+
+[[tasks.symbols]]
+ticker = "AAPL"
+market = "us"
+conid = "265598"
+
+[[tasks.symbols]]
+ticker = "MSFT"
+market = "us"
+conid = "272093"
+
+[[tasks]]
+name = "longbridge_manual_limit"
+broker = "longbridge"
+action = "place"
+side = "buy"
+pricing = { kind = "limit", price = 50.0 }
+risk = { allow_margin = false }
+
+[[tasks.symbols]]
+ticker = "700"
+market = "hk"
+quantity = 100
+
