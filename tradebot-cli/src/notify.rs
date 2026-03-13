@@ -20,38 +20,55 @@ const EMAIL_SENDER_ENV: &str = "TRADEBOT_EMAIL_SENDER";
 pub struct NotificationPreview {
     pub subject: String,
     pub body: String,
+    pub html_body: String,
 }
 
 pub fn notify_task_success(config: &AppConfig, task: &TaskConfig, result: &ExecutionResult) {
+    let subject = format_subject(config, task, "completed");
+    let body = format_success_body(config, task, result);
+    let html_body = format_success_html(config, task, result);
     dispatch_notification(
         task,
         NotificationEvent::Success,
-        &format_subject(config, task, "completed"),
-        &format_success_body(config, task, result),
+        &subject,
+        &body,
+        &html_body,
     );
     if task_result_is_filled(result) {
+        let subject = format_subject(config, task, "filled");
+        let body = format_filled_body(config, task, result);
+        let html_body = format_filled_html(config, task, result);
         dispatch_notification(
             task,
             NotificationEvent::Filled,
-            &format_subject(config, task, "filled"),
-            &format_filled_body(config, task, result),
+            &subject,
+            &body,
+            &html_body,
         );
     } else if task_result_is_partially_filled(result) {
+        let subject = format_subject(config, task, "partial_filled");
+        let body = format_partial_filled_body(config, task, result);
+        let html_body = format_partial_filled_html(config, task, result);
         dispatch_notification(
             task,
             NotificationEvent::PartialFilled,
-            &format_subject(config, task, "partial_filled"),
-            &format_partial_filled_body(config, task, result),
+            &subject,
+            &body,
+            &html_body,
         );
     }
 }
 
 pub fn notify_task_failure(config: &AppConfig, task: &TaskConfig, error: &str) {
+    let subject = format_subject(config, task, "failed");
+    let body = format_failure_body(config, task, error);
+    let html_body = format_failure_html(config, task, error);
     dispatch_notification(
         task,
         NotificationEvent::Failure,
-        &format_subject(config, task, "failed"),
-        &format_failure_body(config, task, error),
+        &subject,
+        &body,
+        &html_body,
     );
 }
 
@@ -67,11 +84,17 @@ pub fn preview_notification(
             Ok(NotificationPreview {
                 subject: format_subject(config, task, "completed"),
                 body: format_success_body(config, task, &result),
+                html_body: format_success_html(config, task, &result),
             })
         }
         NotificationEvent::Failure => Ok(NotificationPreview {
             subject: format_subject(config, task, "failed"),
             body: format_failure_body(
+                config,
+                task,
+                failure_error.unwrap_or("preview failure message"),
+            ),
+            html_body: format_failure_html(
                 config,
                 task,
                 failure_error.unwrap_or("preview failure message"),
@@ -82,6 +105,7 @@ pub fn preview_notification(
             Ok(NotificationPreview {
                 subject: format_subject(config, task, "filled"),
                 body: format_filled_body(config, task, &result),
+                html_body: format_filled_html(config, task, &result),
             })
         }
         NotificationEvent::PartialFilled => {
@@ -89,6 +113,7 @@ pub fn preview_notification(
             Ok(NotificationPreview {
                 subject: format_subject(config, task, "partial_filled"),
                 body: format_partial_filled_body(config, task, &result),
+                html_body: format_partial_filled_html(config, task, &result),
             })
         }
     }
@@ -112,11 +137,17 @@ pub fn send_preview_notification(
         })?;
 
     let preview = preview_notification(config, task, event, failure_error)?;
-    send_email_blocking(email, &preview.subject, &preview.body)?;
+    send_email_blocking(email, &preview.subject, &preview.body, &preview.html_body)?;
     Ok(preview)
 }
 
-fn dispatch_notification(task: &TaskConfig, event: NotificationEvent, subject: &str, body: &str) {
+fn dispatch_notification(
+    task: &TaskConfig,
+    event: NotificationEvent,
+    subject: &str,
+    body: &str,
+    html_body: &str,
+) {
     let Some(email_config) = task
         .notify
         .as_ref()
@@ -128,7 +159,7 @@ fn dispatch_notification(task: &TaskConfig, event: NotificationEvent, subject: &
         return;
     }
 
-    if let Err(err) = send_email_blocking(email_config, subject, body) {
+    if let Err(err) = send_email_blocking(email_config, subject, body, html_body) {
         warn!(
             task = %task.name,
             event = ?event,
@@ -143,6 +174,7 @@ fn send_email_blocking(
     email: &EmailNotificationConfig,
     subject: &str,
     body: &str,
+    html_body: &str,
 ) -> Result<(), String> {
     let region = required_env(EMAIL_REGION_ENV)?;
     let sender = required_env(EMAIL_SENDER_ENV)?;
@@ -169,9 +201,19 @@ fn send_email_blocking(
             .charset("UTF-8")
             .build()
             .map_err(|err| format!("build email body: {err}"))?;
+        let html_body_content = Content::builder()
+            .data(html_body)
+            .charset("UTF-8")
+            .build()
+            .map_err(|err| format!("build html email body: {err}"))?;
         let message = Message::builder()
             .subject(subject_content)
-            .body(Body::builder().text(body_content).build())
+            .body(
+                Body::builder()
+                    .text(body_content)
+                    .html(html_body_content)
+                    .build(),
+            )
             .build();
         let destination = Destination::builder()
             .set_to_addresses(Some(email.to.clone()))
@@ -219,20 +261,12 @@ fn format_subject(config: &AppConfig, task: &TaskConfig, status: &str) -> String
 }
 
 fn format_success_body(config: &AppConfig, task: &TaskConfig, result: &ExecutionResult) -> String {
-    let timestamp = timestamp_in_config_timezone(config);
-    let payload = serde_json::to_string_pretty(result)
-        .unwrap_or_else(|_| "{\"error\":\"failed to serialize execution result\"}".into());
-    let note_section = format_task_note_section(task);
-
-    format!(
-        "Task finished successfully.\n\nTime: {timestamp}\nTask: {}\nBroker: {} ({})\nAction: {:?}{note_section}\nOrders: {}\nCancellations: {}\nWarnings: {}\n\nResult:\n{payload}",
-        result.task_name,
-        result.broker_name,
-        result.broker_kind,
-        result.action,
-        result.orders.len(),
-        result.cancellations.len(),
-        result.warnings.len(),
+    format_result_text(
+        config,
+        task,
+        result,
+        "completed",
+        "Task completed successfully.",
     )
 }
 
@@ -241,26 +275,20 @@ fn format_failure_body(config: &AppConfig, task: &TaskConfig, error: &str) -> St
     let note_section = format_task_note_section(task);
 
     format!(
-        "Task finished with an error.\n\nTime: {timestamp}\nTask: {}\nBroker: {}\nAction: {:?}{note_section}\nError: {error}",
-        task.name, task.broker, task.action
+        "Task failed.\n\nSummary\nTime: {timestamp}\nTask: {}\nBroker: {}\nAction: {}{note_section}\n\nError\n{error}",
+        task.name,
+        task.broker,
+        format_action(task.action)
     )
 }
 
 fn format_filled_body(config: &AppConfig, task: &TaskConfig, result: &ExecutionResult) -> String {
-    let timestamp = timestamp_in_config_timezone(config);
-    let payload = serde_json::to_string_pretty(result)
-        .unwrap_or_else(|_| "{\"error\":\"failed to serialize execution result\"}".into());
-    let note_section = format_task_note_section(task);
-
-    format!(
-        "Task finished with all tracked orders filled.\n\nTime: {timestamp}\nTask: {}\nBroker: {} ({})\nAction: {:?}{note_section}\nOrders: {}\nCancellations: {}\nWarnings: {}\n\nResult:\n{payload}",
-        result.task_name,
-        result.broker_name,
-        result.broker_kind,
-        result.action,
-        result.orders.len(),
-        result.cancellations.len(),
-        result.warnings.len(),
+    format_result_text(
+        config,
+        task,
+        result,
+        "filled",
+        "All tracked orders filled.",
     )
 }
 
@@ -269,20 +297,114 @@ fn format_partial_filled_body(
     task: &TaskConfig,
     result: &ExecutionResult,
 ) -> String {
+    format_result_text(
+        config,
+        task,
+        result,
+        "partial_filled",
+        "Task completed with partial fills.",
+    )
+}
+
+fn format_success_html(config: &AppConfig, task: &TaskConfig, result: &ExecutionResult) -> String {
+    format_result_html(
+        config,
+        task,
+        result,
+        "completed",
+        "Task completed successfully.",
+    )
+}
+
+fn format_failure_html(config: &AppConfig, task: &TaskConfig, error: &str) -> String {
+    let timestamp = timestamp_in_config_timezone(config);
+    let note_html = format_task_note_html(task);
+    let error = html_escape(error);
+
+    format!(
+        "<!doctype html><html><body style=\"margin:0;padding:0;background:#f5f7fb;color:#132033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;\"><div style=\"max-width:760px;margin:0 auto;padding:24px 16px;\"><div style=\"background:#ffffff;border:1px solid #d8e0eb;border-radius:14px;padding:24px;\"><div style=\"font-size:13px;letter-spacing:0.08em;text-transform:uppercase;color:#7a8798;\">Tradebot</div><h1 style=\"margin:8px 0 20px;font-size:24px;line-height:1.3;\">Task failed</h1><table style=\"width:100%;border-collapse:collapse;font-size:14px;\"><tr><td style=\"padding:8px 0;color:#5f6b7a;width:140px;\">Time</td><td style=\"padding:8px 0;\">{timestamp}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Task</td><td style=\"padding:8px 0;\">{task_name}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Broker</td><td style=\"padding:8px 0;\">{broker_name}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Action</td><td style=\"padding:8px 0;\">{action}</td></tr></table>{note_html}<h2 style=\"margin:24px 0 8px;font-size:16px;\">Error</h2><pre style=\"margin:0;padding:16px;background:#fff4f4;border:1px solid #f2c7c7;border-radius:10px;color:#8a1f1f;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;\">{error}</pre></div></div></body></html>",
+        task_name = html_escape(&task.name),
+        broker_name = html_escape(&task.broker),
+        action = html_escape(format_action(task.action)),
+    )
+}
+
+fn format_filled_html(config: &AppConfig, task: &TaskConfig, result: &ExecutionResult) -> String {
+    format_result_html(
+        config,
+        task,
+        result,
+        "filled",
+        "All tracked orders filled.",
+    )
+}
+
+fn format_partial_filled_html(
+    config: &AppConfig,
+    task: &TaskConfig,
+    result: &ExecutionResult,
+) -> String {
+    format_result_html(
+        config,
+        task,
+        result,
+        "partial_filled",
+        "Task completed with partial fills.",
+    )
+}
+
+fn format_result_text(
+    config: &AppConfig,
+    task: &TaskConfig,
+    result: &ExecutionResult,
+    status: &str,
+    headline: &str,
+) -> String {
     let timestamp = timestamp_in_config_timezone(config);
     let payload = serde_json::to_string_pretty(result)
         .unwrap_or_else(|_| "{\"error\":\"failed to serialize execution result\"}".into());
     let note_section = format_task_note_section(task);
+    let orders_section = format_order_lines_text(&result.orders);
+    let warnings_section = format_warning_lines_text(&result.warnings);
 
     format!(
-        "Task finished with partial fills.\n\nTime: {timestamp}\nTask: {}\nBroker: {} ({})\nAction: {:?}{note_section}\nOrders: {}\nCancellations: {}\nWarnings: {}\n\nResult:\n{payload}",
+        "{headline}\n\nSummary\nTime: {timestamp}\nTask: {}\nBroker: {} ({})\nAction: {}\nStatus: {status}\nOrders: {}\nCancellations: {}\nWarnings: {}{note_section}\n\nOrders\n{orders_section}\n\nWarnings\n{warnings_section}\n\nRaw result\n{payload}",
         result.task_name,
         result.broker_name,
         result.broker_kind,
-        result.action,
+        format_action(result.action),
         result.orders.len(),
         result.cancellations.len(),
         result.warnings.len(),
+    )
+}
+
+fn format_result_html(
+    config: &AppConfig,
+    task: &TaskConfig,
+    result: &ExecutionResult,
+    status: &str,
+    headline: &str,
+) -> String {
+    let timestamp = timestamp_in_config_timezone(config);
+    let payload = serde_json::to_string_pretty(result)
+        .unwrap_or_else(|_| "{\"error\":\"failed to serialize execution result\"}".into());
+    let note_html = format_task_note_html(task);
+    let orders_html = format_order_rows_html(&result.orders);
+    let warnings_html = format_warning_list_html(&result.warnings);
+
+    format!(
+        "<!doctype html><html><body style=\"margin:0;padding:0;background:#f5f7fb;color:#132033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;\"><div style=\"max-width:760px;margin:0 auto;padding:24px 16px;\"><div style=\"background:#ffffff;border:1px solid #d8e0eb;border-radius:14px;padding:24px;\"><div style=\"font-size:13px;letter-spacing:0.08em;text-transform:uppercase;color:#7a8798;\">Tradebot</div><h1 style=\"margin:8px 0 20px;font-size:24px;line-height:1.3;\">{headline}</h1><table style=\"width:100%;border-collapse:collapse;font-size:14px;\"><tr><td style=\"padding:8px 0;color:#5f6b7a;width:140px;\">Time</td><td style=\"padding:8px 0;\">{timestamp}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Task</td><td style=\"padding:8px 0;\">{task_name}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Broker</td><td style=\"padding:8px 0;\">{broker_name} ({broker_kind})</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Action</td><td style=\"padding:8px 0;\">{action}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Status</td><td style=\"padding:8px 0;\"><span style=\"display:inline-block;padding:4px 10px;border-radius:999px;background:#e8f1ff;color:#174ea6;font-size:12px;font-weight:600;\">{status}</span></td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Orders</td><td style=\"padding:8px 0;\">{orders}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Cancellations</td><td style=\"padding:8px 0;\">{cancellations}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Warnings</td><td style=\"padding:8px 0;\">{warnings}</td></tr></table>{note_html}<h2 style=\"margin:24px 0 8px;font-size:16px;\">Orders</h2><table style=\"width:100%;border-collapse:collapse;font-size:13px;border:1px solid #d8e0eb;border-radius:10px;overflow:hidden;\"><thead><tr style=\"background:#f7f9fc;color:#5f6b7a;text-align:left;\"><th style=\"padding:10px 12px;border-bottom:1px solid #d8e0eb;\">Symbol</th><th style=\"padding:10px 12px;border-bottom:1px solid #d8e0eb;\">Status</th><th style=\"padding:10px 12px;border-bottom:1px solid #d8e0eb;\">Filled</th><th style=\"padding:10px 12px;border-bottom:1px solid #d8e0eb;\">Avg Price</th><th style=\"padding:10px 12px;border-bottom:1px solid #d8e0eb;\">Broker Order ID</th></tr></thead><tbody>{orders_html}</tbody></table><h2 style=\"margin:24px 0 8px;font-size:16px;\">Warnings</h2>{warnings_html}<h2 style=\"margin:24px 0 8px;font-size:16px;\">Raw result</h2><pre style=\"margin:0;padding:16px;background:#0f172a;color:#e2e8f0;border-radius:10px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;\">{payload}</pre></div></div></body></html>",
+        headline = html_escape(headline),
+        task_name = html_escape(&result.task_name),
+        broker_name = html_escape(&result.broker_name),
+        broker_kind = html_escape(&result.broker_kind),
+        action = html_escape(format_action(result.action)),
+        status = html_escape(status),
+        orders = result.orders.len(),
+        cancellations = result.cancellations.len(),
+        warnings = result.warnings.len(),
+        payload = html_escape(&payload),
     )
 }
 
@@ -291,8 +413,122 @@ fn format_task_note_section(task: &TaskConfig) -> String {
         .as_deref()
         .map(str::trim)
         .filter(|note| !note.is_empty())
-        .map(|note| format!("\nNote:\n{note}"))
+        .map(|note| format!("\n\nNote\n{note}"))
         .unwrap_or_default()
+}
+
+fn format_task_note_html(task: &TaskConfig) -> String {
+    task.note
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty())
+        .map(|note| {
+            format!(
+                "<h2 style=\"margin:24px 0 8px;font-size:16px;\">Note</h2><div style=\"padding:16px;background:#f7f9fc;border:1px solid #d8e0eb;border-radius:10px;white-space:pre-wrap;\">{}</div>",
+                html_escape(note)
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn format_order_lines_text(orders: &[OrderResult]) -> String {
+    if orders.is_empty() {
+        return "- none".into();
+    }
+
+    orders
+        .iter()
+        .map(|order| {
+            format!(
+                "- {} | status: {} | filled: {} | avg: {} | broker_order_id: {}",
+                order_symbol(order),
+                order.status,
+                format_optional_number(order.filled_qty),
+                format_optional_number(order.avg_price),
+                order.broker_order_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_warning_lines_text(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        return "- none".into();
+    }
+
+    warnings
+        .iter()
+        .map(|warning| format!("- {warning}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_order_rows_html(orders: &[OrderResult]) -> String {
+    if orders.is_empty() {
+        return "<tr><td colspan=\"5\" style=\"padding:12px;color:#5f6b7a;\">No orders</td></tr>"
+            .into();
+    }
+
+    orders
+        .iter()
+        .map(|order| {
+            format!(
+                "<tr><td style=\"padding:10px 12px;border-bottom:1px solid #edf1f5;\">{symbol}</td><td style=\"padding:10px 12px;border-bottom:1px solid #edf1f5;\">{status}</td><td style=\"padding:10px 12px;border-bottom:1px solid #edf1f5;\">{filled}</td><td style=\"padding:10px 12px;border-bottom:1px solid #edf1f5;\">{avg}</td><td style=\"padding:10px 12px;border-bottom:1px solid #edf1f5;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;\">{order_id}</td></tr>",
+                symbol = html_escape(order_symbol(order)),
+                status = html_escape(&order.status),
+                filled = html_escape(&format_optional_number(order.filled_qty)),
+                avg = html_escape(&format_optional_number(order.avg_price)),
+                order_id = html_escape(&order.broker_order_id),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn format_warning_list_html(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        return "<div style=\"padding:16px;background:#f7f9fc;border:1px solid #d8e0eb;border-radius:10px;color:#5f6b7a;\">No warnings</div>".into();
+    }
+
+    let items = warnings
+        .iter()
+        .map(|warning| format!("<li style=\"margin:0 0 8px;\">{}</li>", html_escape(warning)))
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        "<ul style=\"margin:0;padding-left:20px;\">{items}</ul>"
+    )
+}
+
+fn order_symbol(order: &OrderResult) -> &str {
+    order
+        .raw_metadata
+        .get("symbol")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("UNKNOWN")
+}
+
+fn format_optional_number(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.4}"))
+        .unwrap_or_else(|| "n/a".into())
+}
+
+fn format_action(action: TaskAction) -> &'static str {
+    match action {
+        TaskAction::Place => "place",
+        TaskAction::Cancel => "cancel",
+    }
+}
+
+fn html_escape(raw: impl AsRef<str>) -> String {
+    raw.as_ref()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn task_result_is_filled(result: &ExecutionResult) -> bool {
@@ -551,13 +787,13 @@ mod tests {
         let preview =
             preview_notification(&config, &task, NotificationEvent::Filled, None).unwrap();
 
-        assert_eq!(preview.subject, "[stock-trader] task preview filled");
-        assert!(
-            preview
-                .body
-                .contains("Task finished with all tracked orders filled.")
-        );
-        assert!(preview.body.contains("Note:\nSend a preview notification with task context."));
+        assert_eq!(preview.subject, "[stock-trader] preview filled");
+        assert!(preview.body.contains("All tracked orders filled."));
+        assert!(preview.body.contains("Summary"));
+        assert!(preview.body.contains("Orders"));
+        assert!(preview.body.contains("Note\nSend a preview notification with task context."));
         assert!(preview.body.contains("\"status\": \"filled\""));
+        assert!(preview.html_body.contains("<table"));
+        assert!(preview.html_body.contains("All tracked orders filled."));
     }
 }

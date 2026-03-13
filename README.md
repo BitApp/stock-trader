@@ -80,7 +80,7 @@ note = "Morning rebalance for the core US basket."
 notify = { email = { to = ["ops@example.com"], on = ["success", "failure"] } }
 ```
 
-`on` defaults to `["success"]`. When enabled, both `run` and scheduled `watch` executions send a plain-text email after the task ends. If a task sets `note`, that text is included in the email body.
+`on` defaults to `["success"]`. When enabled, both `run` and scheduled `watch` executions send multipart text/HTML emails after the task ends. If a task sets `note`, that text is included in the notification body.
 
 You can also render and send a notification template manually with:
 
@@ -88,7 +88,7 @@ You can also render and send a notification template manually with:
 cargo run -p tradebot-cli -- preview-notify --config config/example.toml --task ibkr_us_rebalance --event success
 ```
 
-`preview-notify` sends to the task's configured `notify.email.to` recipients and prints the exact subject/body that was sent.
+`preview-notify` sends to the task's configured `notify.email.to` recipients and prints the plain-text version of the subject/body that was sent.
 
 Supported notification events are:
 - `success`: task returned successfully
