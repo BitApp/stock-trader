@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 
 use aws_config::{BehaviorVersion, Region};
@@ -6,7 +7,7 @@ use chrono::{Offset, Utc};
 use tokio::runtime::Builder;
 use tracing::warn;
 use trading_core::{
-    AppConfig, EmailNotificationConfig, ExecutionResult, NotificationEvent, TaskConfig,
+    AppConfig, EmailNotificationConfig, ExecutionResult, NotificationEvent, TaskAction, TaskConfig,
 };
 
 const EMAIL_REGION_ENV: &str = "TRADEBOT_EMAIL_REGION";
@@ -19,6 +20,21 @@ pub fn notify_task_success(config: &AppConfig, task: &TaskConfig, result: &Execu
         &format_subject(config, task, "completed"),
         &format_success_body(config, result),
     );
+    if task_result_is_filled(result) {
+        dispatch_notification(
+            task,
+            NotificationEvent::Filled,
+            &format_subject(config, task, "filled"),
+            &format_filled_body(config, result),
+        );
+    } else if task_result_is_partially_filled(result) {
+        dispatch_notification(
+            task,
+            NotificationEvent::PartialFilled,
+            &format_subject(config, task, "partial_filled"),
+            &format_partial_filled_body(config, result),
+        );
+    }
 }
 
 pub fn notify_task_failure(config: &AppConfig, task: &TaskConfig, error: &str) {
@@ -148,6 +164,99 @@ fn format_failure_body(config: &AppConfig, task: &TaskConfig, error: &str) -> St
     )
 }
 
+fn format_filled_body(config: &AppConfig, result: &ExecutionResult) -> String {
+    let timestamp = timestamp_in_config_timezone(config);
+    let payload = serde_json::to_string_pretty(result)
+        .unwrap_or_else(|_| "{\"error\":\"failed to serialize execution result\"}".into());
+
+    format!(
+        "Task finished with all tracked orders filled.\n\nTime: {timestamp}\nTask: {}\nBroker: {} ({})\nAction: {:?}\nOrders: {}\nCancellations: {}\nWarnings: {}\n\nResult:\n{payload}",
+        result.task_name,
+        result.broker_name,
+        result.broker_kind,
+        result.action,
+        result.orders.len(),
+        result.cancellations.len(),
+        result.warnings.len(),
+    )
+}
+
+fn format_partial_filled_body(config: &AppConfig, result: &ExecutionResult) -> String {
+    let timestamp = timestamp_in_config_timezone(config);
+    let payload = serde_json::to_string_pretty(result)
+        .unwrap_or_else(|_| "{\"error\":\"failed to serialize execution result\"}".into());
+
+    format!(
+        "Task finished with partial fills.\n\nTime: {timestamp}\nTask: {}\nBroker: {} ({})\nAction: {:?}\nOrders: {}\nCancellations: {}\nWarnings: {}\n\nResult:\n{payload}",
+        result.task_name,
+        result.broker_name,
+        result.broker_kind,
+        result.action,
+        result.orders.len(),
+        result.cancellations.len(),
+        result.warnings.len(),
+    )
+}
+
+fn task_result_is_filled(result: &ExecutionResult) -> bool {
+    if result.action != TaskAction::Place || result.orders.is_empty() {
+        return false;
+    }
+
+    latest_tracked_orders(result)
+        .into_iter()
+        .all(order_is_filled)
+}
+
+fn task_result_is_partially_filled(result: &ExecutionResult) -> bool {
+    if result.action != TaskAction::Place
+        || result.orders.is_empty()
+        || task_result_is_filled(result)
+    {
+        return false;
+    }
+
+    latest_tracked_orders(result)
+        .into_iter()
+        .any(order_has_any_fill)
+}
+
+fn latest_tracked_orders(result: &ExecutionResult) -> Vec<&trading_core::OrderResult> {
+    let mut latest_by_symbol = BTreeMap::new();
+    let mut fallback_orders = Vec::new();
+
+    for order in &result.orders {
+        if let Some(symbol) = order
+            .raw_metadata
+            .get("symbol")
+            .and_then(serde_json::Value::as_str)
+        {
+            latest_by_symbol.insert(symbol.to_string(), order);
+        } else {
+            fallback_orders.push(order);
+        }
+    }
+
+    if latest_by_symbol.is_empty() {
+        result.orders.iter().collect()
+    } else {
+        latest_by_symbol
+            .into_values()
+            .chain(fallback_orders)
+            .collect()
+    }
+}
+
+fn order_is_filled(order: &trading_core::OrderResult) -> bool {
+    order.status.eq_ignore_ascii_case("filled")
+}
+
+fn order_has_any_fill(order: &trading_core::OrderResult) -> bool {
+    order.filled_qty.unwrap_or(0.0) > 0.0
+        || order.status.eq_ignore_ascii_case("partially_filled")
+        || order.status.eq_ignore_ascii_case("partial_filled")
+}
+
 fn timestamp_in_config_timezone(config: &AppConfig) -> String {
     let timezone = config
         .defaults
@@ -156,4 +265,72 @@ fn timestamp_in_config_timezone(config: &AppConfig) -> String {
         .unwrap_or(chrono_tz::UTC);
     let now = Utc::now().with_timezone(&timezone);
     format!("{} {}", now.format("%Y-%m-%d %H:%M:%S"), now.offset().fix())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use trading_core::{ExecutionResult, OrderResult, TaskAction};
+
+    use super::{task_result_is_filled, task_result_is_partially_filled};
+
+    fn sample_order(status: &str, symbol: &str, filled_qty: Option<f64>) -> OrderResult {
+        OrderResult {
+            broker_order_id: format!("broker-{symbol}-{status}"),
+            client_order_id: format!("client-{symbol}-{status}"),
+            status: status.into(),
+            filled_qty,
+            avg_price: None,
+            message: None,
+            raw_metadata: json!({ "symbol": symbol }),
+        }
+    }
+
+    fn sample_result(orders: Vec<OrderResult>) -> ExecutionResult {
+        ExecutionResult {
+            task_name: "task".into(),
+            broker_name: "broker".into(),
+            broker_kind: "kind".into(),
+            action: TaskAction::Place,
+            orders,
+            cancellations: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn filled_notification_requires_latest_order_per_symbol_to_be_filled() {
+        let result = sample_result(vec![
+            sample_order("cancelled_for_retry", "SPY", Some(0.0)),
+            sample_order("filled", "SPY", Some(10.0)),
+            sample_order("filled", "QQQ", Some(5.0)),
+        ]);
+
+        assert!(task_result_is_filled(&result));
+    }
+
+    #[test]
+    fn filled_notification_skips_submitted_orders() {
+        let result = sample_result(vec![sample_order("submitted", "SPY", None)]);
+
+        assert!(!task_result_is_filled(&result));
+    }
+
+    #[test]
+    fn partial_filled_notification_requires_fill_but_not_all_filled() {
+        let result = sample_result(vec![
+            sample_order("partially_filled", "SPY", Some(3.0)),
+            sample_order("submitted", "QQQ", None),
+        ]);
+
+        assert!(task_result_is_partially_filled(&result));
+        assert!(!task_result_is_filled(&result));
+    }
+
+    #[test]
+    fn partial_filled_notification_skips_fully_filled_tasks() {
+        let result = sample_result(vec![sample_order("filled", "SPY", Some(10.0))]);
+
+        assert!(!task_result_is_partially_filled(&result));
+    }
 }

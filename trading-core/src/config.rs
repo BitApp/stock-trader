@@ -102,6 +102,8 @@ pub struct EmailNotificationConfig {
 pub enum NotificationEvent {
     Success,
     Failure,
+    Filled,
+    PartialFilled,
 }
 
 #[derive(Debug, Clone, Deserialize)]

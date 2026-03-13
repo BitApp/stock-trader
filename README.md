@@ -81,6 +81,12 @@ notify = { email = { to = ["ops@example.com"], on = ["success", "failure"] } }
 
 `on` defaults to `["success"]`. When enabled, both `run` and scheduled `watch` executions send a plain-text email after the task ends.
 
+Supported notification events are:
+- `success`: task returned successfully
+- `failure`: task returned an error
+- `filled`: all tracked orders in the result ended in `filled`
+- `partial_filled`: at least one tracked order had fill quantity, but not all tracked orders ended in `filled`
+
 The SES transport reads these environment variables at runtime:
 
 ```bash
