@@ -33,6 +33,11 @@ where
         .as_ref()
         .map(|risk| risk.allow_margin)
         .unwrap_or(false);
+    let extended_hours = task
+        .session
+        .as_ref()
+        .map(|session| session.extended_hours)
+        .unwrap_or(false);
 
     let mut resolved = Vec::with_capacity(task.symbols.len());
     for symbol in &task.symbols {
@@ -102,6 +107,7 @@ where
             limit_price,
             tif,
             allow_margin,
+            extended_hours,
             client_order_id,
             client_tag: task.client_tag.clone(),
             raw_metadata: Value::Null,
@@ -290,6 +296,9 @@ mod tests {
             side: Some(OrderSide::Sell),
             pricing: Some(PricingSpec::Market),
             risk: None,
+            session: Some(crate::models::SessionPolicy {
+                extended_hours: true,
+            }),
             shared_budget: None,
             time_in_force: None,
             client_tag: None,
@@ -344,5 +353,6 @@ mod tests {
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].quantity, 12);
         assert_eq!(orders[0].order_type, crate::models::BrokerOrderType::Market);
+        assert!(orders[0].extended_hours);
     }
 }

@@ -90,6 +90,12 @@ pub struct RiskPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionPolicy {
+    #[serde(default)]
+    pub extended_hours: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstrumentRef {
     pub ticker: String,
     pub market: Market,
@@ -164,6 +170,8 @@ pub struct BrokerOrderRequest {
     pub limit_price: Option<f64>,
     pub tif: TimeInForce,
     pub allow_margin: bool,
+    #[serde(default)]
+    pub extended_hours: bool,
     pub client_order_id: String,
     #[serde(default)]
     pub client_tag: Option<String>,

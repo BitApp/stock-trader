@@ -6,11 +6,10 @@ use longport::{
     trade::{
         GetStockPositionsOptions, GetTodayOrdersOptions, OrderDetail as LongportOrderDetail,
         OrderSide as LongportOrderSide, OrderStatus as LongportOrderStatus,
-        OrderType as LongportOrderType, SubmitOrderOptions,
+        OrderType as LongportOrderType, OutsideRTH as LongportOutsideRTH, SubmitOrderOptions,
         TimeInForceType as LongportTimeInForceType,
     },
 };
-use serde::Deserialize;
 use serde_json::json;
 use trading_core::{
     Broker, BrokerConfig, BrokerFactory, BrokerHealth, BrokerOrderRequest, BrokerOrderType,
@@ -27,8 +26,8 @@ impl BrokerFactory for LongbridgeBrokerFactory {
     }
 
     fn build(&self, broker_name: &str, config: &BrokerConfig) -> Result<Box<dyn Broker>> {
-        let settings = parse_settings(config)?;
-        let (trade, quote, init_error) = match build_contexts(&settings) {
+        validate_settings(config)?;
+        let (trade, quote, init_error) = match build_contexts() {
             Ok((trade, quote)) => (Some(trade), Some(quote), None),
             Err(err) => (None, None, Some(err.to_string())),
         };
@@ -40,13 +39,6 @@ impl BrokerFactory for LongbridgeBrokerFactory {
             init_error,
         }))
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct LongbridgeSettings {
-    app_key_env: String,
-    app_secret_env: String,
-    access_token_env: String,
 }
 
 struct LongbridgeBroker {
@@ -197,6 +189,9 @@ impl Broker for LongbridgeBroker {
                         &order.instrument.broker_symbol,
                     )?);
                 }
+                if order.extended_hours {
+                    options = options.outside_rth(LongportOutsideRTH::AnyTime);
+                }
 
                 let remark = order
                     .client_tag
@@ -279,50 +274,44 @@ impl LongbridgeBroker {
     }
 }
 
-fn build_contexts(settings: &LongbridgeSettings) -> Result<(TradeContextSync, QuoteContextSync)> {
-    let config = Arc::new(build_sdk_config(settings)?);
+fn build_contexts() -> Result<(TradeContextSync, QuoteContextSync)> {
+    let config = Arc::new(build_sdk_config()?);
     let trade = TradeContextSync::try_new(config.clone(), |_| ()).map_err(map_longbridge_error)?;
     let quote = QuoteContextSync::try_new(config, |_| ()).map_err(map_longbridge_error)?;
     Ok((trade, quote))
 }
 
-fn build_sdk_config(settings: &LongbridgeSettings) -> Result<LongportConfig> {
-    let app_key = env::var(&settings.app_key_env).map_err(|_| {
+fn build_sdk_config() -> Result<LongportConfig> {
+    let app_key = env::var("LONGPORT_APP_KEY").map_err(|_| {
         TradeBotError::broker(
             "longbridge",
-            format!(
-                "missing Longbridge environment variable `{}`",
-                settings.app_key_env
-            ),
+            "missing Longbridge environment variable `LONGPORT_APP_KEY`".to_string(),
         )
     })?;
-    let app_secret = env::var(&settings.app_secret_env).map_err(|_| {
+    let app_secret = env::var("LONGPORT_APP_SECRET").map_err(|_| {
         TradeBotError::broker(
             "longbridge",
-            format!(
-                "missing Longbridge environment variable `{}`",
-                settings.app_secret_env
-            ),
+            "missing Longbridge environment variable `LONGPORT_APP_SECRET`".to_string(),
         )
     })?;
-    let access_token = env::var(&settings.access_token_env).map_err(|_| {
+    let access_token = env::var("LONGPORT_ACCESS_TOKEN").map_err(|_| {
         TradeBotError::broker(
             "longbridge",
-            format!(
-                "missing Longbridge environment variable `{}`",
-                settings.access_token_env
-            ),
+            "missing Longbridge environment variable `LONGPORT_ACCESS_TOKEN`".to_string(),
         )
     })?;
 
     Ok(LongportConfig::new(app_key, app_secret, access_token).dont_print_quote_packages())
 }
 
-fn parse_settings(config: &BrokerConfig) -> Result<LongbridgeSettings> {
-    let value = toml::Value::Table(config.settings.clone().into_iter().collect());
-    value
-        .try_into()
-        .map_err(|err| TradeBotError::Config(format!("invalid longbridge settings: {err}")))
+fn validate_settings(config: &BrokerConfig) -> Result<()> {
+    if config.settings.is_empty() {
+        return Ok(());
+    }
+
+    Err(TradeBotError::Config(
+        "longbridge broker settings now come from environment variables; remove inline settings from config".into(),
+    ))
 }
 
 fn map_longbridge_error(err: impl ToString) -> TradeBotError {

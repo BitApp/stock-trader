@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use reqwest::blocking::{Client, ClientBuilder};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::debug;
 use trading_core::{
@@ -35,18 +34,11 @@ impl BrokerFactory for IbkrBrokerFactory {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
 struct IbkrSettings {
     base_url: String,
     account_id: String,
-    #[serde(default)]
     allow_insecure_tls: bool,
-    #[serde(default = "default_true")]
     auto_confirm_replies: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 struct IbkrBroker {
@@ -166,6 +158,9 @@ impl Broker for IbkrBroker {
                 });
                 if let Some(limit_price) = order.limit_price {
                     body["price"] = json!(limit_price);
+                }
+                if order.extended_hours {
+                    body["outsideRTH"] = json!(true);
                 }
                 if order.allow_margin {
                     body["isClose"] = json!(false);
@@ -428,10 +423,50 @@ impl IbkrBroker {
 }
 
 fn parse_settings(config: &BrokerConfig) -> Result<IbkrSettings> {
-    let value = toml::Value::Table(config.settings.clone().into_iter().collect());
-    value
-        .try_into()
-        .map_err(|err| TradeBotError::Config(format!("invalid ibkr settings: {err}")))
+    if !config.settings.is_empty() {
+        return Err(TradeBotError::Config(
+            "ibkr broker settings now come from environment variables; remove inline settings from config".into(),
+        ));
+    }
+
+    Ok(IbkrSettings {
+        base_url: required_env("IBKR_BASE_URL", "ibkr")?,
+        account_id: required_env("IBKR_ACCOUNT_ID", "ibkr")?,
+        allow_insecure_tls: optional_bool_env("IBKR_ALLOW_INSECURE_TLS", false, "ibkr")?,
+        auto_confirm_replies: optional_bool_env("IBKR_AUTO_CONFIRM_REPLIES", true, "ibkr")?,
+    })
+}
+
+fn required_env(name: &str, broker: &str) -> Result<String> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        Ok(_) => Err(TradeBotError::broker(
+            broker,
+            format!("environment variable `{name}` is set but empty"),
+        )),
+        Err(_) => Err(TradeBotError::broker(
+            broker,
+            format!("missing environment variable `{name}`"),
+        )),
+    }
+}
+
+fn optional_bool_env(name: &str, default: bool, broker: &str) -> Result<bool> {
+    match std::env::var(name) {
+        Ok(value) => parse_env_bool(name, &value, broker),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_env_bool(name: &str, value: &str, broker: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(TradeBotError::broker(
+            broker,
+            format!("environment variable `{name}` must be a boolean"),
+        )),
+    }
 }
 
 fn parse_ibkr_number(value: Option<&Value>) -> Option<f64> {

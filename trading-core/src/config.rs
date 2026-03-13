@@ -7,8 +7,8 @@ use serde::Deserialize;
 use crate::{
     errors::{Result, TradeBotError},
     models::{
-        ExecutionPolicy, OrderSide, PricingSpec, RiskPolicy, SharedBudget, SymbolTarget,
-        TaskAction, TimeInForce,
+        ExecutionPolicy, OrderSide, PricingSpec, RiskPolicy, SessionPolicy, SharedBudget,
+        SymbolTarget, TaskAction, TimeInForce,
     },
 };
 
@@ -70,6 +70,8 @@ pub struct TaskConfig {
     pub pricing: Option<PricingSpec>,
     #[serde(default)]
     pub risk: Option<RiskPolicy>,
+    #[serde(default)]
+    pub session: Option<SessionPolicy>,
     #[serde(default)]
     pub shared_budget: Option<SharedBudget>,
     #[serde(default)]
@@ -321,6 +323,12 @@ impl AppConfig {
                 task.name
             )));
         }
+        if task.session.is_some() {
+            return Err(TradeBotError::Validation(format!(
+                "task `{}` cancel action cannot define session",
+                task.name
+            )));
+        }
         Ok(())
     }
 }
@@ -533,8 +541,8 @@ mod tests {
     use crate::{
         errors::TradeBotError,
         models::{
-            ExecutionPolicy, InstrumentRef, Market, OrderSide, PricingSpec, SharedBudget,
-            SymbolTarget, TaskAction,
+            ExecutionPolicy, InstrumentRef, Market, OrderSide, PricingSpec, SessionPolicy,
+            SharedBudget, SymbolTarget, TaskAction,
         },
     };
 
@@ -554,6 +562,7 @@ mod tests {
             side: Some(OrderSide::Buy),
             pricing: Some(PricingSpec::Counterparty),
             risk: None,
+            session: None,
             shared_budget: Some(SharedBudget { amount: 1000.0 }),
             time_in_force: None,
             client_tag: None,
@@ -691,6 +700,22 @@ mod tests {
         let err = sample_config(task).validate().unwrap_err();
         assert!(
             matches!(err, TradeBotError::Validation(message) if message.contains("execution policy is only supported for place action"))
+        );
+    }
+
+    #[test]
+    fn rejects_session_for_cancel_task() {
+        let mut task = sample_task();
+        task.action = TaskAction::Cancel;
+        task.pricing = None;
+        task.shared_budget = None;
+        task.session = Some(SessionPolicy {
+            extended_hours: true,
+        });
+
+        let err = sample_config(task).validate().unwrap_err();
+        assert!(
+            matches!(err, TradeBotError::Validation(message) if message.contains("cancel action cannot define session"))
         );
     }
 }

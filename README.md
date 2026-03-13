@@ -38,6 +38,12 @@ cargo run -p tradebot-cli -- run --config config/example.toml --task ibkr_us_reb
 cargo run -p tradebot-cli -- watch --config config/example.toml
 ```
 
+Or watch a directory of task files:
+
+```bash
+cargo run -p tradebot-cli -- watch --config-dir config/tasks
+```
+
 Scheduled tasks are declared inline on each task with a local-time `schedule` block:
 
 ```toml
@@ -48,7 +54,20 @@ timezone = "Asia/Shanghai"
 schedule = { time = "09:30", weekdays = ["mon", "tue", "wed", "thu", "fri"] }
 ```
 
-`defaults.timezone` determines how scheduled task times are interpreted. Edit the config file while `watch` is running and the process will apply the next valid version without a restart.
+`defaults.timezone` determines how scheduled task times are interpreted. Edit the config file while `watch` is running and the process will apply the next valid version without a restart. With `--config-dir`, the watcher loads every `*.toml` in the directory, merges them, and hot-reloads file additions, removals, and edits.
+
+Broker connectivity now comes from environment variables rather than inline broker settings:
+
+```bash
+export LONGPORT_APP_KEY=...
+export LONGPORT_APP_SECRET=...
+export LONGPORT_ACCESS_TOKEN=...
+
+export IBKR_BASE_URL=https://127.0.0.1:5000/v1/api
+export IBKR_ACCOUNT_ID=DU123456
+export IBKR_ALLOW_INSECURE_TLS=true
+export IBKR_AUTO_CONFIRM_REPLIES=true
+```
 
 Task completion emails can be enabled with a task-level recipient list:
 
@@ -75,6 +94,14 @@ Managed order policies can be attached to `place` tasks. For example, this will 
 pricing = { kind = "counterparty" }
 execution = { kind = "cancel_replace", timeout_seconds = 300, poll_seconds = 5, max_attempts = 3 }
 ```
+
+Extended-hours trading can be enabled per `place` task for brokers that support it:
+
+```toml
+session = { extended_hours = true }
+```
+
+This sets IBKR `outsideRTH = true` and Longbridge `outside_rth = ANY_TIME`. It is intended for US pre-market and post-market eligibility.
 
 ## Notes
 

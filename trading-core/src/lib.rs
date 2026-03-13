@@ -17,5 +17,5 @@ pub use models::{
     BrokerHealth, BrokerOrderRequest, BrokerOrderType, CancelRequest, CancelResult,
     ExecutionPolicy, ExecutionResult, InstrumentRef, Market, OrderResult, OrderSide,
     OrderStatusSnapshot, PositionSnapshot, PricingSpec, Quote, ResolvedInstrument, RiskPolicy,
-    SharedBudget, SymbolTarget, TaskAction, TimeInForce, ValidationReport,
+    SessionPolicy, SharedBudget, SymbolTarget, TaskAction, TimeInForce, ValidationReport,
 };

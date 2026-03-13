@@ -30,8 +30,10 @@ enum Command {
         task: String,
     },
     Watch {
-        #[arg(long)]
-        config: PathBuf,
+        #[arg(long, conflicts_with = "config_dir")]
+        config: Option<PathBuf>,
+        #[arg(long, conflicts_with = "config")]
+        config_dir: Option<PathBuf>,
         #[arg(long, default_value_t = 5)]
         poll_seconds: u64,
     },
@@ -73,8 +75,9 @@ fn run() -> Result<()> {
         }
         Command::Watch {
             config,
+            config_dir,
             poll_seconds,
-        } => watch::watch(config, poll_seconds)?,
+        } => watch::watch(config, config_dir, poll_seconds)?,
     }
     Ok(())
 }
