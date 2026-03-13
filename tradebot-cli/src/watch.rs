@@ -107,6 +107,7 @@ impl WatchState {
 
             match self.engine.run_task(&task.name) {
                 Ok(result) => {
+                    crate::notify::notify_task_success(&self.config, task, &result);
                     info!(
                         task = %task.name,
                         broker = %result.broker_name,
@@ -123,6 +124,7 @@ impl WatchState {
                     }
                 }
                 Err(err) => {
+                    crate::notify::notify_task_failure(&self.config, task, &err.to_string());
                     error!(task = %task.name, error = %err, "scheduled task failed");
                 }
             }
@@ -162,6 +164,12 @@ fn schedule_is_due(
         return false;
     }
 
+    if let Ok(Some(date)) = schedule.parse_date() {
+        if date != today {
+            return false;
+        }
+    }
+
     if !schedule.is_enabled_on(weekday) {
         return false;
     }
@@ -181,6 +189,7 @@ mod tests {
 
     fn weekday_only_schedule() -> TaskScheduleConfig {
         TaskScheduleConfig {
+            date: None,
             time: "09:30".into(),
             weekdays: vec![ScheduleWeekday::Mon, ScheduleWeekday::Tue],
             enabled: true,
@@ -225,6 +234,31 @@ mod tests {
             today,
             Weekday::Mon,
             NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            None,
+        ));
+    }
+
+    #[test]
+    fn schedule_runs_only_on_matching_date() {
+        let schedule = TaskScheduleConfig {
+            date: Some("2026-03-13".into()),
+            time: "21:30".into(),
+            weekdays: Vec::new(),
+            enabled: true,
+        };
+
+        assert!(schedule_is_due(
+            &schedule,
+            NaiveDate::from_ymd_opt(2026, 3, 13).unwrap(),
+            Weekday::Fri,
+            NaiveTime::from_hms_opt(21, 31, 0).unwrap(),
+            None,
+        ));
+        assert!(!schedule_is_due(
+            &schedule,
+            NaiveDate::from_ymd_opt(2026, 3, 14).unwrap(),
+            Weekday::Sat,
+            NaiveTime::from_hms_opt(21, 31, 0).unwrap(),
             None,
         ));
     }

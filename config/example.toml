@@ -2,6 +2,9 @@
 timezone = "Asia/Shanghai"
 default_tif = "day"
 
+[defaults.email]
+subject_prefix = "[stock-trader]"
+
 [brokers.longbridge]
 kind = "longbridge"
 app_key_env = "LONGBRIDGE_APP_KEY"
@@ -25,6 +28,7 @@ pricing = { kind = "counterparty" }
 shared_budget = { amount = 10000.0 }
 risk = { allow_margin = true }
 client_tag = "pm2-us-rebalance"
+notify = { email = { to = ["ops@example.com"], on = ["success", "failure"] } }
 
 [[tasks.symbols]]
 ticker = "AAPL"

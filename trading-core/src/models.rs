@@ -67,6 +67,18 @@ pub enum PricingSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutionPolicy {
+    CancelReplace {
+        timeout_seconds: u64,
+        #[serde(default = "default_poll_seconds")]
+        poll_seconds: u64,
+        #[serde(default = "default_max_attempts")]
+        max_attempts: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SharedBudget {
     pub amount: f64,
 }
@@ -91,6 +103,8 @@ pub struct InstrumentRef {
 pub struct SymbolTarget {
     #[serde(flatten)]
     pub instrument: InstrumentRef,
+    #[serde(default)]
+    pub close_position: bool,
     #[serde(default)]
     pub quantity: Option<u64>,
     #[serde(default)]
@@ -124,6 +138,13 @@ pub struct Quote {
     pub last: Option<f64>,
     #[serde(default)]
     pub currency: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PositionSnapshot {
+    pub instrument: ResolvedInstrument,
+    pub quantity: u64,
+    pub available_quantity: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +210,24 @@ pub struct CancelResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderStatusSnapshot {
+    pub broker_order_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub filled_qty: Option<f64>,
+    #[serde(default)]
+    pub remaining_qty: Option<f64>,
+    #[serde(default)]
+    pub avg_price: Option<f64>,
+    #[serde(default)]
+    pub message: Option<String>,
+    pub is_active: bool,
+    pub is_final: bool,
+    #[serde(default)]
+    pub raw_metadata: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionResult {
     pub task_name: String,
     pub broker_name: String,
@@ -217,4 +256,12 @@ pub struct ValidationReport {
     pub broker_name: String,
     pub broker_kind: String,
     pub health: BrokerHealth,
+}
+
+fn default_poll_seconds() -> u64 {
+    5
+}
+
+fn default_max_attempts() -> u32 {
+    1
 }

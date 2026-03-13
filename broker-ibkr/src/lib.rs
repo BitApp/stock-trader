@@ -6,8 +6,8 @@ use serde_json::{Value, json};
 use tracing::debug;
 use trading_core::{
     Broker, BrokerConfig, BrokerFactory, BrokerHealth, BrokerOrderRequest, BrokerOrderType,
-    CancelRequest, CancelResult, InstrumentRef, OrderResult, Quote, ResolvedInstrument, Result,
-    TradeBotError,
+    CancelRequest, CancelResult, InstrumentRef, OrderResult, OrderStatusSnapshot, PositionSnapshot,
+    Quote, ResolvedInstrument, Result, TradeBotError,
 };
 
 #[derive(Default)]
@@ -143,6 +143,12 @@ impl Broker for IbkrBroker {
         })
     }
 
+    fn fetch_position(&self, _instrument: &ResolvedInstrument) -> Result<PositionSnapshot> {
+        Err(TradeBotError::Unsupported(
+            "IBKR position-backed close_position tasks are not wired yet".into(),
+        ))
+    }
+
     fn place_orders(&self, orders: &[BrokerOrderRequest]) -> Result<Vec<OrderResult>> {
         let payload = orders
             .iter()
@@ -180,46 +186,95 @@ impl Broker for IbkrBroker {
     }
 
     fn cancel_orders(&self, request: &CancelRequest) -> Result<Vec<CancelResult>> {
-        let live_orders = self.get_json::<Value>(&format!(
-            "iserver/account/orders?force=true&accountId={}",
-            self.settings.account_id
-        ))?;
-        let rows = live_orders
-            .get("orders")
-            .and_then(Value::as_array)
-            .ok_or_else(|| TradeBotError::broker("ibkr", "invalid live orders response"))?;
+        let rows = self.live_orders()?;
 
         let mut results = Vec::new();
 
         for row in rows {
-            if !matches_cancel_filter(row, request) {
+            if !matches_cancel_filter(&row, request) {
                 continue;
             }
-            let order_id = row
-                .get("orderId")
-                .and_then(value_to_string)
-                .ok_or_else(|| TradeBotError::broker("ibkr", "missing orderId"))?;
-            let response = self.delete_json(&format!(
-                "iserver/account/{}/order/{}",
-                self.settings.account_id, order_id
-            ))?;
-
-            results.push(CancelResult {
-                broker_order_id: order_id,
-                status: response
-                    .get("msg")
-                    .and_then(Value::as_str)
-                    .unwrap_or("cancel_submitted")
-                    .to_string(),
-                message: response
-                    .get("msg")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-                raw_metadata: response,
-            });
+            let order_id = row_order_id(&row)?;
+            results.push(self.cancel_order_by_id(&order_id)?);
         }
 
         Ok(results)
+    }
+
+    fn cancel_order_by_id(&self, broker_order_id: &str) -> Result<CancelResult> {
+        let response = self.delete_json(&format!(
+            "iserver/account/{}/order/{}",
+            self.settings.account_id, broker_order_id
+        ))?;
+
+        Ok(CancelResult {
+            broker_order_id: broker_order_id.to_string(),
+            status: response
+                .get("msg")
+                .and_then(Value::as_str)
+                .unwrap_or("cancel_submitted")
+                .to_string(),
+            message: response
+                .get("msg")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            raw_metadata: response,
+        })
+    }
+
+    fn get_order_status(&self, broker_order_id: &str) -> Result<OrderStatusSnapshot> {
+        let row = self
+            .live_orders()?
+            .into_iter()
+            .find(|row| {
+                row.get("orderId")
+                    .and_then(value_to_string)
+                    .map(|id| id == broker_order_id)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                TradeBotError::broker("ibkr", format!("order `{broker_order_id}` not found"))
+            })?;
+
+        Ok(OrderStatusSnapshot {
+            broker_order_id: broker_order_id.to_string(),
+            status: row
+                .get("status")
+                .or_else(|| row.get("order_status"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            filled_qty: row
+                .get("filledQuantity")
+                .or_else(|| row.get("filled_qty"))
+                .and_then(|value| parse_ibkr_number(Some(value))),
+            remaining_qty: row
+                .get("remainingQuantity")
+                .or_else(|| row.get("remaining_qty"))
+                .and_then(|value| parse_ibkr_number(Some(value))),
+            avg_price: row
+                .get("avgPrice")
+                .or_else(|| row.get("avg_price"))
+                .and_then(|value| parse_ibkr_number(Some(value))),
+            message: row
+                .get("statusDescription")
+                .or_else(|| row.get("message"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            is_active: !ibkr_status_is_final(
+                row.get("status")
+                    .or_else(|| row.get("order_status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+            ),
+            is_final: ibkr_status_is_final(
+                row.get("status")
+                    .or_else(|| row.get("order_status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+            ),
+            raw_metadata: row,
+        })
     }
 }
 
@@ -358,6 +413,18 @@ impl IbkrBroker {
         let base = self.settings.base_url.trim_end_matches('/');
         format!("{base}/{path}")
     }
+
+    fn live_orders(&self) -> Result<Vec<Value>> {
+        let live_orders = self.get_json::<Value>(&format!(
+            "iserver/account/orders?force=true&accountId={}",
+            self.settings.account_id
+        ))?;
+        live_orders
+            .get("orders")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| TradeBotError::broker("ibkr", "invalid live orders response"))
+    }
 }
 
 fn parse_settings(config: &BrokerConfig) -> Result<IbkrSettings> {
@@ -373,6 +440,19 @@ fn parse_ibkr_number(value: Option<&Value>) -> Option<f64> {
         Some(Value::Number(num)) => num.as_f64(),
         _ => None,
     }
+}
+
+fn row_order_id(row: &Value) -> Result<String> {
+    row.get("orderId")
+        .and_then(value_to_string)
+        .ok_or_else(|| TradeBotError::broker("ibkr", "missing orderId"))
+}
+
+fn ibkr_status_is_final(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "filled" | "cancelled" | "canceled" | "inactive" | "rejected" | "expired"
+    )
 }
 
 fn parse_conid_value(conid: Option<&str>) -> Value {

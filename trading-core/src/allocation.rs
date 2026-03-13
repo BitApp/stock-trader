@@ -5,8 +5,8 @@ use crate::{
     config::{DefaultsConfig, TaskConfig},
     errors::{Result, TradeBotError},
     models::{
-        BrokerOrderRequest, BrokerOrderType, InstrumentRef, OrderSide, PricingSpec, Quote,
-        ResolvedInstrument,
+        BrokerOrderRequest, BrokerOrderType, InstrumentRef, OrderSide, PositionSnapshot,
+        PricingSpec, Quote, ResolvedInstrument,
     },
 };
 
@@ -14,6 +14,7 @@ pub fn materialize_orders<F, G>(
     task: &TaskConfig,
     defaults: &DefaultsConfig,
     mut resolve: F,
+    mut fetch_position: impl FnMut(&ResolvedInstrument) -> Result<PositionSnapshot>,
     mut fetch_quote: G,
 ) -> Result<Vec<BrokerOrderRequest>>
 where
@@ -55,7 +56,14 @@ where
             &mut fetch_quote,
         )?;
 
-        let quantity = if let Some(quantity) = symbol.quantity {
+        let quantity = if symbol.close_position {
+            fetch_position_quantity(
+                task,
+                &symbol.instrument.ticker,
+                &resolved_instrument,
+                &mut fetch_position,
+            )?
+        } else if let Some(quantity) = symbol.quantity {
             quantity
         } else if let Some(amount) = symbol.amount {
             amount_to_quantity(amount, reference_price, &symbol.instrument.ticker)?
@@ -101,6 +109,25 @@ where
     }
 
     Ok(output)
+}
+
+fn fetch_position_quantity<F>(
+    task: &TaskConfig,
+    ticker: &str,
+    resolved_instrument: &ResolvedInstrument,
+    fetch_position: &mut F,
+) -> Result<u64>
+where
+    F: FnMut(&ResolvedInstrument) -> Result<PositionSnapshot>,
+{
+    let position = fetch_position(resolved_instrument)?;
+    if position.available_quantity == 0 {
+        return Err(TradeBotError::Validation(format!(
+            "task `{}` symbol `{ticker}` has no available position to close",
+            task.name
+        )));
+    }
+    Ok(position.available_quantity)
 }
 
 pub fn estimate_reference_price<G>(
@@ -196,7 +223,7 @@ fn build_client_order_id(task_name: &str, broker_symbol: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::models::{Market, PricingSpec, Quote, ResolvedInstrument};
+    use crate::models::{Market, PositionSnapshot, PricingSpec, Quote, ResolvedInstrument};
 
     use super::*;
 
@@ -249,5 +276,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(price, 89.0);
+    }
+
+    #[test]
+    fn close_position_uses_available_quantity() {
+        let task = TaskConfig {
+            name: "close-spy".into(),
+            broker: "paper".into(),
+            action: crate::models::TaskAction::Place,
+            schedule: None,
+            execution: None,
+            notify: None,
+            side: Some(OrderSide::Sell),
+            pricing: Some(PricingSpec::Market),
+            risk: None,
+            shared_budget: None,
+            time_in_force: None,
+            client_tag: None,
+            all_open: false,
+            symbols: vec![crate::models::SymbolTarget {
+                instrument: InstrumentRef {
+                    ticker: "SPY".into(),
+                    market: Market::Us,
+                    broker_symbol: None,
+                    conid: None,
+                },
+                close_position: true,
+                quantity: None,
+                amount: None,
+                weight: None,
+                limit_price: None,
+                client_order_id: None,
+                broker_options: std::collections::BTreeMap::new(),
+            }],
+        };
+        let defaults = DefaultsConfig::default();
+
+        let orders = materialize_orders(
+            &task,
+            &defaults,
+            |instrument| {
+                Ok(ResolvedInstrument {
+                    ticker: instrument.ticker.clone(),
+                    market: instrument.market,
+                    broker_symbol: "SPY.US".into(),
+                    conid: None,
+                })
+            },
+            |_instrument| {
+                Ok(PositionSnapshot {
+                    instrument: resolved("SPY"),
+                    quantity: 15,
+                    available_quantity: 12,
+                })
+            },
+            |_instrument| {
+                Ok(Quote {
+                    bid: Some(500.0),
+                    ask: Some(500.5),
+                    last: Some(500.2),
+                    currency: None,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].quantity, 12);
+        assert_eq!(orders[0].order_type, crate::models::BrokerOrderType::Market);
     }
 }

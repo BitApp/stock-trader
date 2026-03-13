@@ -50,8 +50,35 @@ schedule = { time = "09:30", weekdays = ["mon", "tue", "wed", "thu", "fri"] }
 
 `defaults.timezone` determines how scheduled task times are interpreted. Edit the config file while `watch` is running and the process will apply the next valid version without a restart.
 
+Task completion emails can be enabled with a task-level recipient list:
+
+```toml
+[defaults.email]
+subject_prefix = "[stock-trader]"
+
+[[tasks]]
+notify = { email = { to = ["ops@example.com"], on = ["success", "failure"] } }
+```
+
+`on` defaults to `["success"]`. When enabled, both `run` and scheduled `watch` executions send a plain-text email after the task ends.
+
+The SES transport reads these environment variables at runtime:
+
+```bash
+export TRADEBOT_EMAIL_REGION=ap-southeast-1
+export TRADEBOT_EMAIL_SENDER=bot@example.com
+```
+
+Managed order policies can be attached to `place` tasks. For example, this will place at the current counterparty price, wait 5 minutes, then cancel and resubmit if still unfilled:
+
+```toml
+pricing = { kind = "counterparty" }
+execution = { kind = "cancel_replace", timeout_seconds = 300, poll_seconds = 5, max_attempts = 3 }
+```
+
 ## Notes
 
 - `IBKR` requires a running `Client Portal Gateway` session.
-- `Longbridge` is already wired into the unified broker registry, but live trading calls are still intentionally stubbed behind explicit runtime errors.
+- `Longbridge` now supports live position lookup, quote lookup, order submission, order-detail polling, and cancel-by-id for managed execution loops.
+- `IBKR` now supports managed cancel-replace execution via order polling from `iserver/account/orders` and cancel-by-id.
 - The public API is centered around `trading_core::TradingEngine`.

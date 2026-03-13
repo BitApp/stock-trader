@@ -1,3 +1,4 @@
+mod notify;
 mod watch;
 
 use std::path::PathBuf;
@@ -56,9 +57,19 @@ fn run() -> Result<()> {
             }
         }
         Command::Run { config, task } => {
-            let engine = load_engine(config)?;
-            let result = engine.run_task(&task)?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            let loaded = AppConfig::load(&config)?;
+            let task_config = loaded.task(&task)?.clone();
+            let engine = build_engine(loaded.clone());
+            match engine.run_task(&task) {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    notify::notify_task_success(&loaded, &task_config, &result);
+                }
+                Err(err) => {
+                    notify::notify_task_failure(&loaded, &task_config, &err.to_string());
+                    return Err(err);
+                }
+            }
         }
         Command::Watch {
             config,
@@ -66,11 +77,6 @@ fn run() -> Result<()> {
         } => watch::watch(config, poll_seconds)?,
     }
     Ok(())
-}
-
-fn load_engine(config_path: PathBuf) -> Result<TradingEngine> {
-    let config = AppConfig::load(config_path)?;
-    Ok(build_engine(config))
 }
 
 fn build_engine(config: AppConfig) -> TradingEngine {

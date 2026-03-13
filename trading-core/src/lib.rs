@@ -8,13 +8,14 @@ mod models;
 pub use allocation::{estimate_reference_price, materialize_orders};
 pub use broker::{Broker, BrokerFactory, BrokerRegistry};
 pub use config::{
-    AppConfig, BrokerConfig, DefaultsConfig, ScheduleWeekday, TaskConfig, TaskScheduleConfig,
+    AppConfig, BrokerConfig, DefaultsConfig, EmailNotificationConfig, EmailTransportConfig,
+    NotificationEvent, ScheduleWeekday, TaskConfig, TaskNotificationConfig, TaskScheduleConfig,
 };
 pub use engine::TradingEngine;
 pub use errors::{Result, TradeBotError};
 pub use models::{
     BrokerHealth, BrokerOrderRequest, BrokerOrderType, CancelRequest, CancelResult,
-    ExecutionResult, InstrumentRef, Market, OrderResult, OrderSide, PricingSpec, Quote,
-    ResolvedInstrument, RiskPolicy, SharedBudget, SymbolTarget, TaskAction, TimeInForce,
-    ValidationReport,
+    ExecutionPolicy, ExecutionResult, InstrumentRef, Market, OrderResult, OrderSide,
+    OrderStatusSnapshot, PositionSnapshot, PricingSpec, Quote, ResolvedInstrument, RiskPolicy,
+    SharedBudget, SymbolTarget, TaskAction, TimeInForce, ValidationReport,
 };

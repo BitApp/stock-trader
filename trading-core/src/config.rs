@@ -7,7 +7,8 @@ use serde::Deserialize;
 use crate::{
     errors::{Result, TradeBotError},
     models::{
-        OrderSide, PricingSpec, RiskPolicy, SharedBudget, SymbolTarget, TaskAction, TimeInForce,
+        ExecutionPolicy, OrderSide, PricingSpec, RiskPolicy, SharedBudget, SymbolTarget,
+        TaskAction, TimeInForce,
     },
 };
 
@@ -25,6 +26,8 @@ pub struct DefaultsConfig {
     pub timezone: String,
     #[serde(default = "default_tif")]
     pub default_tif: TimeInForce,
+    #[serde(default)]
+    pub email: Option<EmailTransportConfig>,
 }
 
 impl Default for DefaultsConfig {
@@ -32,8 +35,15 @@ impl Default for DefaultsConfig {
         Self {
             timezone: default_timezone(),
             default_tif: default_tif(),
+            email: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmailTransportConfig {
+    #[serde(default)]
+    pub subject_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +60,10 @@ pub struct TaskConfig {
     pub action: TaskAction,
     #[serde(default)]
     pub schedule: Option<TaskScheduleConfig>,
+    #[serde(default)]
+    pub execution: Option<ExecutionPolicy>,
+    #[serde(default)]
+    pub notify: Option<TaskNotificationConfig>,
     #[serde(default)]
     pub side: Option<OrderSide>,
     #[serde(default)]
@@ -69,7 +83,29 @@ pub struct TaskConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct TaskNotificationConfig {
+    #[serde(default)]
+    pub email: Option<EmailNotificationConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmailNotificationConfig {
+    pub to: Vec<String>,
+    #[serde(default = "default_notification_events")]
+    pub on: Vec<NotificationEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationEvent {
+    Success,
+    Failure,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct TaskScheduleConfig {
+    #[serde(default)]
+    pub date: Option<String>,
     pub time: String,
     #[serde(default)]
     pub weekdays: Vec<ScheduleWeekday>,
@@ -154,6 +190,14 @@ impl AppConfig {
             schedule.validate(&task.name)?;
         }
 
+        if let Some(execution) = &task.execution {
+            validate_execution_policy(&task.name, task.action, execution)?;
+        }
+
+        if let Some(notify) = &task.notify {
+            notify.validate(&self.defaults, &task.name)?;
+        }
+
         if task.symbols.is_empty() && !task.all_open {
             return Err(TradeBotError::Validation(format!(
                 "task `{}` must declare symbols unless all_open = true",
@@ -183,9 +227,19 @@ impl AppConfig {
         })?;
 
         let mut has_explicit_allocation = false;
+        let mut has_close_position = false;
         let mut weight_sum = 0.0;
 
         for symbol in &task.symbols {
+            if symbol.close_position {
+                has_close_position = true;
+                if symbol.quantity.is_some() || symbol.amount.is_some() || symbol.weight.is_some() {
+                    return Err(TradeBotError::Validation(format!(
+                        "task `{}` symbol `{}` cannot combine close_position with quantity/amount/weight",
+                        task.name, symbol.instrument.ticker
+                    )));
+                }
+            }
             if symbol.quantity.is_some() && symbol.amount.is_some() {
                 return Err(TradeBotError::Validation(format!(
                     "task `{}` symbol `{}` cannot set both quantity and amount",
@@ -218,6 +272,13 @@ impl AppConfig {
             }
         }
 
+        if has_close_position && task.side != Some(OrderSide::Sell) {
+            return Err(TradeBotError::Validation(format!(
+                "task `{}` close_position requires side = \"sell\"",
+                task.name
+            )));
+        }
+
         if let Some(shared_budget) = &task.shared_budget {
             if shared_budget.amount <= 0.0 {
                 return Err(TradeBotError::Validation(format!(
@@ -231,15 +292,21 @@ impl AppConfig {
                     task.name
                 )));
             }
+            if has_close_position {
+                return Err(TradeBotError::Validation(format!(
+                    "task `{}` cannot combine shared_budget with close_position symbols",
+                    task.name
+                )));
+            }
             if (weight_sum - 0.0).abs() < f64::EPSILON {
                 return Err(TradeBotError::Validation(format!(
                     "task `{}` shared_budget requires symbol weights",
                     task.name
                 )));
             }
-        } else if !has_explicit_allocation {
+        } else if !has_explicit_allocation && !has_close_position {
             return Err(TradeBotError::Validation(format!(
-                "task `{}` requires quantity/amount or shared_budget",
+                "task `{}` requires quantity/amount, close_position, or shared_budget",
                 task.name
             )));
         }
@@ -270,6 +337,48 @@ fn default_enabled() -> bool {
     true
 }
 
+fn default_notification_events() -> Vec<NotificationEvent> {
+    vec![NotificationEvent::Success]
+}
+
+fn validate_execution_policy(
+    task_name: &str,
+    action: TaskAction,
+    execution: &ExecutionPolicy,
+) -> Result<()> {
+    if action != TaskAction::Place {
+        return Err(TradeBotError::Validation(format!(
+            "task `{task_name}` execution policy is only supported for place action"
+        )));
+    }
+
+    match execution {
+        ExecutionPolicy::CancelReplace {
+            timeout_seconds,
+            poll_seconds,
+            max_attempts,
+        } => {
+            if *poll_seconds == 0 {
+                return Err(TradeBotError::Validation(format!(
+                    "task `{task_name}` execution.poll_seconds must be positive"
+                )));
+            }
+            if *max_attempts == 0 {
+                return Err(TradeBotError::Validation(format!(
+                    "task `{task_name}` execution.max_attempts must be at least 1"
+                )));
+            }
+            if *timeout_seconds == 0 && *max_attempts == 1 {
+                return Err(TradeBotError::Validation(format!(
+                    "task `{task_name}` execution.cancel_replace needs timeout_seconds > 0 or max_attempts > 1"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl DefaultsConfig {
     pub fn parse_timezone(&self) -> Result<Tz> {
         self.timezone.parse::<Tz>().map_err(|_| {
@@ -282,6 +391,19 @@ impl DefaultsConfig {
 }
 
 impl TaskScheduleConfig {
+    pub fn parse_date(&self) -> Result<Option<chrono::NaiveDate>> {
+        self.date
+            .as_deref()
+            .map(|raw| {
+                chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| {
+                    TradeBotError::Config(format!(
+                        "invalid schedule date `{raw}`; expected YYYY-MM-DD"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
     pub fn parse_time(&self) -> Result<NaiveTime> {
         parse_schedule_time(&self.time).ok_or_else(|| {
             TradeBotError::Config(format!(
@@ -302,6 +424,12 @@ impl TaskScheduleConfig {
     }
 
     fn validate(&self, task_name: &str) -> Result<()> {
+        self.parse_date().map_err(|err| match err {
+            TradeBotError::Config(message) => {
+                TradeBotError::Config(format!("task `{task_name}` schedule {message}"))
+            }
+            other => other,
+        })?;
         self.parse_time().map_err(|err| match err {
             TradeBotError::Config(message) => {
                 TradeBotError::Config(format!("task `{task_name}` schedule {message}"))
@@ -348,6 +476,44 @@ impl ScheduleWeekday {
     }
 }
 
+impl TaskNotificationConfig {
+    fn validate(&self, _defaults: &DefaultsConfig, task_name: &str) -> Result<()> {
+        let Some(email) = &self.email else {
+            return Ok(());
+        };
+
+        if email.to.is_empty() {
+            return Err(TradeBotError::Config(format!(
+                "task `{task_name}` notify.email.to must contain at least one recipient"
+            )));
+        }
+
+        for recipient in &email.to {
+            if !looks_like_email(recipient) {
+                return Err(TradeBotError::Config(format!(
+                    "task `{task_name}` notify.email recipient `{recipient}` is not a valid email address"
+                )));
+            }
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        for event in &email.on {
+            if !seen.insert(*event) {
+                return Err(TradeBotError::Config(format!(
+                    "task `{task_name}` notify.email has duplicate event"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn looks_like_email(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    !trimmed.is_empty() && trimmed.contains('@')
+}
+
 fn parse_schedule_time(raw: &str) -> Option<NaiveTime> {
     const FORMATS: [&str; 2] = ["%H:%M", "%H:%M:%S"];
 
@@ -360,11 +526,15 @@ fn parse_schedule_time(raw: &str) -> Option<NaiveTime> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{AppConfig, BrokerConfig, DefaultsConfig, TaskConfig, TaskScheduleConfig};
+    use super::{
+        AppConfig, BrokerConfig, DefaultsConfig, EmailNotificationConfig, NotificationEvent,
+        TaskConfig, TaskNotificationConfig, TaskScheduleConfig,
+    };
     use crate::{
         errors::TradeBotError,
         models::{
-            InstrumentRef, Market, OrderSide, PricingSpec, SharedBudget, SymbolTarget, TaskAction,
+            ExecutionPolicy, InstrumentRef, Market, OrderSide, PricingSpec, SharedBudget,
+            SymbolTarget, TaskAction,
         },
     };
 
@@ -374,10 +544,13 @@ mod tests {
             broker: "paper".into(),
             action: TaskAction::Place,
             schedule: Some(TaskScheduleConfig {
+                date: None,
                 time: "09:30".into(),
                 weekdays: Vec::new(),
                 enabled: true,
             }),
+            execution: None,
+            notify: None,
             side: Some(OrderSide::Buy),
             pricing: Some(PricingSpec::Counterparty),
             risk: None,
@@ -392,6 +565,7 @@ mod tests {
                     broker_symbol: None,
                     conid: None,
                 },
+                close_position: false,
                 quantity: None,
                 amount: None,
                 weight: Some(1.0),
@@ -420,6 +594,19 @@ mod tests {
     fn accepts_schedule_with_hours_and_minutes() {
         let config = sample_config(sample_task());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_task_email_notification_without_transport() {
+        let mut task = sample_task();
+        task.notify = Some(TaskNotificationConfig {
+            email: Some(EmailNotificationConfig {
+                to: vec!["ops@example.com".into()],
+                on: vec![NotificationEvent::Success, NotificationEvent::Failure],
+            }),
+        });
+
+        assert!(sample_config(task).validate().is_ok());
     }
 
     #[test]
@@ -453,6 +640,57 @@ mod tests {
         let err = sample_config(task).validate().unwrap_err();
         assert!(
             matches!(err, TradeBotError::Config(message) if message.contains("duplicate weekday"))
+        );
+    }
+
+    #[test]
+    fn accepts_one_shot_schedule_date() {
+        let mut task = sample_task();
+        task.schedule.as_mut().unwrap().date = Some("2026-03-13".into());
+
+        let config = sample_config(task);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_schedule_date() {
+        let mut task = sample_task();
+        task.schedule.as_mut().unwrap().date = Some("2026/03/13".into());
+
+        let err = sample_config(task).validate().unwrap_err();
+        assert!(
+            matches!(err, TradeBotError::Config(message) if message.contains("invalid schedule date"))
+        );
+    }
+
+    #[test]
+    fn rejects_close_position_with_shared_budget() {
+        let mut task = sample_task();
+        task.side = Some(OrderSide::Sell);
+        task.symbols[0].close_position = true;
+        task.symbols[0].weight = None;
+
+        let err = sample_config(task).validate().unwrap_err();
+        assert!(
+            matches!(err, TradeBotError::Validation(message) if message.contains("cannot combine shared_budget with close_position"))
+        );
+    }
+
+    #[test]
+    fn rejects_execution_policy_for_cancel_task() {
+        let mut task = sample_task();
+        task.action = TaskAction::Cancel;
+        task.pricing = None;
+        task.shared_budget = None;
+        task.execution = Some(ExecutionPolicy::CancelReplace {
+            timeout_seconds: 300,
+            poll_seconds: 5,
+            max_attempts: 2,
+        });
+
+        let err = sample_config(task).validate().unwrap_err();
+        assert!(
+            matches!(err, TradeBotError::Validation(message) if message.contains("execution policy is only supported for place action"))
         );
     }
 }
