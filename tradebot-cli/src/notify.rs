@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::env;
 
 use aws_config::{BehaviorVersion, Region};
+use aws_sdk_sesv2::error::{DisplayErrorContext, ProvideErrorMetadata};
+use aws_sdk_sesv2::operation::send_email::SendEmailError;
 use aws_sdk_sesv2::types::{Body, Content, Destination, EmailContent, Message};
 use chrono::{Offset, Utc};
 use serde_json::json;
@@ -92,6 +94,28 @@ pub fn preview_notification(
     }
 }
 
+pub fn send_preview_notification(
+    config: &AppConfig,
+    task: &TaskConfig,
+    event: NotificationEvent,
+    failure_error: Option<&str>,
+) -> Result<NotificationPreview, String> {
+    let email = task
+        .notify
+        .as_ref()
+        .and_then(|notify| notify.email.as_ref())
+        .ok_or_else(|| {
+            format!(
+                "task `{}` has no notify.email recipients configured",
+                task.name
+            )
+        })?;
+
+    let preview = preview_notification(config, task, event, failure_error)?;
+    send_email_blocking(email, &preview.subject, &preview.body)?;
+    Ok(preview)
+}
+
 fn dispatch_notification(task: &TaskConfig, event: NotificationEvent, subject: &str, body: &str) {
     let Some(email_config) = task
         .notify
@@ -107,6 +131,8 @@ fn dispatch_notification(task: &TaskConfig, event: NotificationEvent, subject: &
     if let Err(err) = send_email_blocking(email_config, subject, body) {
         warn!(
             task = %task.name,
+            event = ?event,
+            recipients = %email_config.to.join(","),
             error = %err,
             "failed to send task email notification"
         );
@@ -159,10 +185,18 @@ fn send_email_blocking(
             .content(content)
             .send()
             .await
-            .map_err(|err| format!("ses send_email: {err}"))?;
+            .map_err(format_send_email_error)?;
 
         Ok(())
     })
+}
+
+fn format_send_email_error(err: aws_sdk_sesv2::error::SdkError<SendEmailError>) -> String {
+    let context = DisplayErrorContext(&err).to_string();
+    let code = err.code().unwrap_or("unknown");
+    let message = err.message().unwrap_or("unknown");
+
+    format!("ses send_email: code={code} message={message} context={context}")
 }
 
 fn required_env(name: &str) -> Result<String, String> {

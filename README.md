@@ -81,6 +81,14 @@ notify = { email = { to = ["ops@example.com"], on = ["success", "failure"] } }
 
 `on` defaults to `["success"]`. When enabled, both `run` and scheduled `watch` executions send a plain-text email after the task ends.
 
+You can also render and send a notification template manually with:
+
+```bash
+cargo run -p tradebot-cli -- preview-notify --config config/example.toml --task ibkr_us_rebalance --event success
+```
+
+`preview-notify` sends to the task's configured `notify.email.to` recipients and prints the exact subject/body that was sent.
+
 Supported notification events are:
 - `success`: task returned successfully
 - `failure`: task returned an error
@@ -93,6 +101,8 @@ The SES transport reads these environment variables at runtime:
 export TRADEBOT_EMAIL_REGION=ap-southeast-1
 export TRADEBOT_EMAIL_SENDER=bot@example.com
 ```
+
+The process also needs valid AWS credentials with `ses:SendEmail` permission. `TRADEBOT_EMAIL_SENDER` must be a verified SES identity in the same region as `TRADEBOT_EMAIL_REGION`. If your SES account is still in sandbox mode, every recipient in `notify.email.to` must also be verified.
 
 Managed order policies can be attached to `place` tasks. For example, this will place at the current counterparty price, wait 5 minutes, then cancel and resubmit if still unfilled:
 

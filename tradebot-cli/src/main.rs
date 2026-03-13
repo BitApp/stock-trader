@@ -113,9 +113,22 @@ fn run() -> Result<()> {
         } => {
             let loaded = AppConfig::load(&config)?;
             let task_config = loaded.task(&task)?.clone();
-            let preview =
-                notify::preview_notification(&loaded, &task_config, event.into(), error.as_deref())
-                    .map_err(TradeBotError::Config)?;
+            let recipients = task_config
+                .notify
+                .as_ref()
+                .and_then(|notify| notify.email.as_ref())
+                .map(|email| email.to.join(", "))
+                .unwrap_or_default();
+            let preview = notify::send_preview_notification(
+                &loaded,
+                &task_config,
+                event.into(),
+                error.as_deref(),
+            )
+            .map_err(TradeBotError::Config)?;
+            if !recipients.is_empty() {
+                println!("Sent to: {recipients}");
+            }
             println!("Subject: {}\n", preview.subject);
             println!("{}", preview.body);
         }
