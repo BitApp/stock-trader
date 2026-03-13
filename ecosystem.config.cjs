@@ -2,7 +2,7 @@ module.exports = {
   apps: [
     {
       name: "stock-tradebot-watch",
-      cwd: "~/projects/stock-trader",
+      cwd: ".",
       script: "./scripts/run-watch.sh",
       interpreter: "bash",
       autorestart: true,
