@@ -8,6 +8,8 @@ authors.workspace = true
 [dependencies]
 broker-ibkr = { path = "../broker-ibkr" }
 broker-longbridge = { path = "../broker-longbridge" }
+chrono.workspace = true
+chrono-tz.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

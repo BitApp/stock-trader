@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
+use chrono::{NaiveTime, Weekday};
+use chrono_tz::Tz;
 use serde::Deserialize;
 
 use crate::{
@@ -47,6 +49,8 @@ pub struct TaskConfig {
     pub broker: String,
     pub action: TaskAction,
     #[serde(default)]
+    pub schedule: Option<TaskScheduleConfig>,
+    #[serde(default)]
     pub side: Option<OrderSide>,
     #[serde(default)]
     pub pricing: Option<PricingSpec>,
@@ -64,15 +68,42 @@ pub struct TaskConfig {
     pub symbols: Vec<SymbolTarget>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaskScheduleConfig {
+    pub time: String,
+    #[serde(default)]
+    pub weekdays: Vec<ScheduleWeekday>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScheduleWeekday {
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
+}
+
 impl AppConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let raw = fs::read_to_string(path)?;
-        let parsed: Self = toml::from_str(&raw)?;
+        Self::from_toml(&raw)
+    }
+
+    pub fn from_toml(raw: &str) -> Result<Self> {
+        let parsed: Self = toml::from_str(raw)?;
         parsed.validate()?;
         Ok(parsed)
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.defaults.parse_timezone()?;
+
         if self.brokers.is_empty() {
             return Err(TradeBotError::Config(
                 "at least one broker is required".into(),
@@ -117,6 +148,10 @@ impl AppConfig {
                 "task `{}` references unknown broker `{}`",
                 task.name, task.broker
             )));
+        }
+
+        if let Some(schedule) = &task.schedule {
+            schedule.validate(&task.name)?;
         }
 
         if task.symbols.is_empty() && !task.all_open {
@@ -223,10 +258,201 @@ impl AppConfig {
     }
 }
 
+fn default_tif() -> TimeInForce {
+    TimeInForce::Day
+}
+
 fn default_timezone() -> String {
     "UTC".to_string()
 }
 
-fn default_tif() -> TimeInForce {
-    TimeInForce::Day
+fn default_enabled() -> bool {
+    true
+}
+
+impl DefaultsConfig {
+    pub fn parse_timezone(&self) -> Result<Tz> {
+        self.timezone.parse::<Tz>().map_err(|_| {
+            TradeBotError::Config(format!(
+                "invalid defaults.timezone `{}`; expected an IANA timezone like `UTC` or `Asia/Shanghai`",
+                self.timezone
+            ))
+        })
+    }
+}
+
+impl TaskScheduleConfig {
+    pub fn parse_time(&self) -> Result<NaiveTime> {
+        parse_schedule_time(&self.time).ok_or_else(|| {
+            TradeBotError::Config(format!(
+                "invalid schedule time `{}`; expected HH:MM or HH:MM:SS",
+                self.time
+            ))
+        })
+    }
+
+    pub fn is_enabled_on(&self, weekday: Weekday) -> bool {
+        self.enabled
+            && (self.weekdays.is_empty()
+                || self
+                    .weekdays
+                    .iter()
+                    .copied()
+                    .any(|configured| configured.to_chrono() == weekday))
+    }
+
+    fn validate(&self, task_name: &str) -> Result<()> {
+        self.parse_time().map_err(|err| match err {
+            TradeBotError::Config(message) => {
+                TradeBotError::Config(format!("task `{task_name}` schedule {message}"))
+            }
+            other => other,
+        })?;
+
+        let mut seen = std::collections::BTreeSet::new();
+        for weekday in &self.weekdays {
+            if !seen.insert(*weekday) {
+                return Err(TradeBotError::Config(format!(
+                    "task `{task_name}` schedule has duplicate weekday `{}`",
+                    weekday.as_str()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ScheduleWeekday {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mon => "mon",
+            Self::Tue => "tue",
+            Self::Wed => "wed",
+            Self::Thu => "thu",
+            Self::Fri => "fri",
+            Self::Sat => "sat",
+            Self::Sun => "sun",
+        }
+    }
+
+    pub fn to_chrono(self) -> Weekday {
+        match self {
+            Self::Mon => Weekday::Mon,
+            Self::Tue => Weekday::Tue,
+            Self::Wed => Weekday::Wed,
+            Self::Thu => Weekday::Thu,
+            Self::Fri => Weekday::Fri,
+            Self::Sat => Weekday::Sat,
+            Self::Sun => Weekday::Sun,
+        }
+    }
+}
+
+fn parse_schedule_time(raw: &str) -> Option<NaiveTime> {
+    const FORMATS: [&str; 2] = ["%H:%M", "%H:%M:%S"];
+
+    FORMATS
+        .iter()
+        .find_map(|format| NaiveTime::parse_from_str(raw, format).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{AppConfig, BrokerConfig, DefaultsConfig, TaskConfig, TaskScheduleConfig};
+    use crate::{
+        errors::TradeBotError,
+        models::{
+            InstrumentRef, Market, OrderSide, PricingSpec, SharedBudget, SymbolTarget, TaskAction,
+        },
+    };
+
+    fn sample_task() -> TaskConfig {
+        TaskConfig {
+            name: "scheduled-rebalance".into(),
+            broker: "paper".into(),
+            action: TaskAction::Place,
+            schedule: Some(TaskScheduleConfig {
+                time: "09:30".into(),
+                weekdays: Vec::new(),
+                enabled: true,
+            }),
+            side: Some(OrderSide::Buy),
+            pricing: Some(PricingSpec::Counterparty),
+            risk: None,
+            shared_budget: Some(SharedBudget { amount: 1000.0 }),
+            time_in_force: None,
+            client_tag: None,
+            all_open: false,
+            symbols: vec![SymbolTarget {
+                instrument: InstrumentRef {
+                    ticker: "AAPL".into(),
+                    market: Market::Us,
+                    broker_symbol: None,
+                    conid: None,
+                },
+                quantity: None,
+                amount: None,
+                weight: Some(1.0),
+                limit_price: None,
+                client_order_id: None,
+                broker_options: BTreeMap::new(),
+            }],
+        }
+    }
+
+    fn sample_config(task: TaskConfig) -> AppConfig {
+        AppConfig {
+            defaults: DefaultsConfig::default(),
+            brokers: BTreeMap::from([(
+                "paper".into(),
+                BrokerConfig {
+                    kind: "mock".into(),
+                    settings: BTreeMap::new(),
+                },
+            )]),
+            tasks: vec![task],
+        }
+    }
+
+    #[test]
+    fn accepts_schedule_with_hours_and_minutes() {
+        let config = sample_config(sample_task());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_timezone() {
+        let mut config = sample_config(sample_task());
+        config.defaults.timezone = "Mars/Olympus".into();
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, TradeBotError::Config(message) if message.contains("invalid defaults.timezone"))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_schedule_time() {
+        let mut task = sample_task();
+        task.schedule.as_mut().unwrap().time = "25:99".into();
+
+        let err = sample_config(task).validate().unwrap_err();
+        assert!(
+            matches!(err, TradeBotError::Config(message) if message.contains("invalid schedule time"))
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_schedule_weekdays() {
+        let mut task = sample_task();
+        task.schedule.as_mut().unwrap().weekdays =
+            vec![super::ScheduleWeekday::Mon, super::ScheduleWeekday::Mon];
+
+        let err = sample_config(task).validate().unwrap_err();
+        assert!(
+            matches!(err, TradeBotError::Config(message) if message.contains("duplicate weekday"))
+        );
+    }
 }

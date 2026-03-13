@@ -19,6 +19,7 @@ auto_confirm_replies = true
 name = "ibkr_us_rebalance"
 broker = "ibkr"
 action = "place"
+schedule = { time = "09:30", weekdays = ["mon", "tue", "wed", "thu", "fri"] }
 side = "buy"
 pricing = { kind = "counterparty" }
 shared_budget = { amount = 10000.0 }
@@ -41,6 +42,7 @@ weight = 0.4
 name = "ibkr_cancel_us_rebalance"
 broker = "ibkr"
 action = "cancel"
+schedule = { time = "15:55", weekdays = ["mon", "tue", "wed", "thu", "fri"] }
 side = "buy"
 client_tag = "pm2-us-rebalance"
 
@@ -66,4 +68,3 @@ risk = { allow_margin = false }
 ticker = "700"
 market = "hk"
 quantity = 100
-

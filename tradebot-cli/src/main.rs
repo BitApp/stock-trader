@@ -1,3 +1,5 @@
+mod watch;
+
 use std::path::PathBuf;
 
 use broker_ibkr::IbkrBrokerFactory;
@@ -26,6 +28,12 @@ enum Command {
         #[arg(long)]
         task: String,
     },
+    Watch {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, default_value_t = 5)]
+        poll_seconds: u64,
+    },
 }
 
 fn main() {
@@ -52,6 +60,10 @@ fn run() -> Result<()> {
             let result = engine.run_task(&task)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
+        Command::Watch {
+            config,
+            poll_seconds,
+        } => watch::watch(config, poll_seconds)?,
     }
     Ok(())
 }
