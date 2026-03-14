@@ -373,7 +373,7 @@ mod tests {
 
     use crate::{
         broker::{Broker, BrokerFactory, BrokerRegistry},
-        config::{AppConfig, BrokerConfig, DefaultsConfig, TaskConfig},
+        config::{AppConfig, BrokerConfig, DefaultsConfig, TaskConfig, WatchConfig},
         errors::Result,
         models::{
             BrokerHealth, BrokerOrderRequest, BrokerOrderType, CancelRequest, CancelResult,
@@ -494,6 +494,7 @@ mod tests {
     fn test_engine_with_registry(task: TaskConfig, registry: BrokerRegistry) -> TradingEngine {
         let config = AppConfig {
             defaults: DefaultsConfig::default(),
+            watch: WatchConfig::default(),
             brokers: BTreeMap::from([(
                 "paper".into(),
                 BrokerConfig {
@@ -803,6 +804,7 @@ mod tests {
 
         let config = AppConfig {
             defaults: DefaultsConfig::default(),
+            watch: WatchConfig::default(),
             brokers: BTreeMap::from([(
                 "paper".into(),
                 BrokerConfig {
@@ -968,6 +970,7 @@ mod tests {
 
         let config = AppConfig {
             defaults: DefaultsConfig::default(),
+            watch: WatchConfig::default(),
             brokers: BTreeMap::from([(
                 "paper".into(),
                 BrokerConfig {

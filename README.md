@@ -54,7 +54,7 @@ timezone = "Asia/Shanghai"
 schedule = { time = "09:30", weekdays = ["mon", "tue", "wed", "thu", "fri"], overdue_policy = "run" }
 ```
 
-`defaults.timezone` determines how scheduled task times are interpreted. `schedule.overdue_policy` defaults to `run`, which backfills a task once the watcher notices the scheduled time has already passed. Set `overdue_policy = "skip"` to suppress those catch-up runs and only fire when the watcher actually crosses the scheduled time while active. Edit the config file while `watch` is running and the process will apply the next valid version without a restart. Config reloads are triggered by file-system events; the watch loop timer is only used to wake up and check whether any scheduled task is now due. With `--config-dir`, the watcher loads every `*.toml` in the directory, merges them, and hot-reloads file additions, removals, and edits.
+`defaults.timezone` determines how scheduled task times are interpreted. `schedule.overdue_policy` defaults to `run`, which backfills a task once the watcher notices the scheduled time has already passed. Set `overdue_policy = "skip"` to suppress those catch-up runs and only fire when the watcher actually crosses the scheduled time while active. Edit the config file while `watch` is running and the process will apply the next valid version without a restart. Config reloads are triggered by file-system events; the watch loop timer is only used to wake up and check whether any scheduled task is now due. With `--config-dir`, the watcher loads every `*.toml` in the directory, merges them, and hot-reloads file additions, removals, and edits. Shared files may contain only common `defaults`, `brokers`, `watch`, or `task_templates` definitions.
 
 Broker connectivity now comes from environment variables rather than inline broker settings:
 
@@ -104,6 +104,30 @@ export IBKR_MAIN_AUTO_CONFIRM_REPLIES=true
 
 When `env_prefix` is omitted, the runtime keeps using the legacy variable names such as `LONGPORT_APP_KEY` and `IBKR_ACCOUNT_ID`.
 
+Repeated task fields can be extracted into reusable templates:
+
+```toml
+[task_templates.ibkr_us_place]
+broker = "ibkr"
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 10000.0 }
+client_tag = "pm2-us-rebalance"
+notify = { email = { to = ["ops@example.com"], on = ["success", "failure"] } }
+
+[[tasks]]
+name = "ibkr_us_rebalance"
+template = "ibkr_us_place"
+
+[[tasks.symbols]]
+ticker = "AAPL"
+market = "us"
+conid = "265598"
+weight = 1.0
+```
+
+Tasks override template fields when both are present. Arrays and nested tables are replaced wholesale, so a task can swap out `symbols`, `notify`, `schedule`, or `execution` without deep-merge rules.
+
 Task completion emails can be enabled with a task-level recipient list:
 
 ```toml
@@ -130,6 +154,16 @@ Supported notification events are:
 - `failure`: task returned an error
 - `filled`: all tracked orders in the result ended in `filled`
 - `partial_filled`: at least one tracked order had fill quantity, but not all tracked orders ended in `filled`
+
+The watcher can also send email when the effective task list is loaded or changes after a config reload:
+
+```toml
+[watch.notify.email]
+to = ["ops@example.com"]
+on = ["task_list_loaded", "task_list_changed"]
+```
+
+`task_list_loaded` fires after the initial successful load, and `task_list_changed` fires after a successful reload that changes any expanded task config.
 
 The SES transport reads these environment variables at runtime:
 

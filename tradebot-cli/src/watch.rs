@@ -11,8 +11,8 @@ use chrono_tz::Tz;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info, warn};
 use trading_core::{
-    AppConfig, DefaultsConfig, Result, ScheduleOverduePolicy, TaskConfig, TaskScheduleConfig,
-    TradeBotError, TradingEngine,
+    AppConfig, ConfigFragment, DefaultsConfig, Result, ScheduleOverduePolicy, TaskConfig,
+    TaskScheduleConfig, TradeBotError, TradingEngine, WatchConfig,
 };
 
 pub fn watch(
@@ -36,6 +36,7 @@ pub fn watch(
         "watching config for scheduled tasks"
     );
     state.log_scheduled_tasks("loaded");
+    crate::notify::notify_task_list_loaded(&state.config, &source.display());
 
     loop {
         let now = Instant::now();
@@ -200,6 +201,7 @@ impl WatchState {
             return;
         }
 
+        let previous_config = self.config.clone();
         let observed_at = Utc::now();
         self.last_fingerprint = snapshot.fingerprint;
         self.last_attempted.retain(|task_name, _| {
@@ -229,6 +231,11 @@ impl WatchState {
             "reloaded config and applied updated schedules"
         );
         self.log_scheduled_tasks("updated");
+        crate::notify::notify_task_list_changed(
+            &previous_config,
+            &self.config,
+            &self.source.display(),
+        );
     }
 
     fn run_due_tasks(&mut self) {
@@ -303,6 +310,7 @@ impl WatchState {
     fn log_scheduled_tasks(&self, verb: &str) {
         let scheduled_tasks = scheduled_task_descriptions(&self.config);
         let (enabled_count, total_count) = scheduled_task_counts(&self.config);
+        let scheduled_count = scheduled_tasks.len();
 
         info!(
             source = %self.source.display(),
@@ -314,35 +322,53 @@ impl WatchState {
         for (index, task) in scheduled_tasks.into_iter().enumerate() {
             info!(
                 source = %self.source.display(),
-                "active task {}/{}: {}",
+                "{} task {}/{}: {}",
+                task.status_label(),
                 index + 1,
-                enabled_count,
-                task
+                scheduled_count,
+                task.description
             );
         }
     }
 }
 
-fn scheduled_task_descriptions(config: &AppConfig) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScheduledTaskDescription {
+    description: String,
+    enabled: bool,
+}
+
+impl ScheduledTaskDescription {
+    fn status_label(&self) -> &'static str {
+        if self.enabled {
+            "active"
+        } else {
+            "disabled"
+        }
+    }
+}
+
+fn scheduled_task_descriptions(config: &AppConfig) -> Vec<ScheduledTaskDescription> {
     config
         .tasks
         .iter()
         .filter_map(|task| {
             let schedule = task.schedule.as_ref()?;
-            if !schedule.enabled {
-                return None;
-            }
-            Some(format_active_scheduled_task(task, schedule))
+            Some(ScheduledTaskDescription {
+                description: format_scheduled_task(task, schedule),
+                enabled: schedule.enabled,
+            })
         })
         .collect()
 }
 
-fn format_active_scheduled_task(task: &TaskConfig, schedule: &TaskScheduleConfig) -> String {
+fn format_scheduled_task(task: &TaskConfig, schedule: &TaskScheduleConfig) -> String {
     format!(
-        "{} | broker={} | action={} | {} | overdue={}",
+        "{} | broker={} | action={} | status={} | {} | overdue={}",
         task.name,
         task.broker,
         task_action_as_str(task.action),
+        if schedule.enabled { "enabled" } else { "disabled" },
         schedule_when_description(schedule),
         overdue_policy_as_str(schedule.overdue_policy)
     )
@@ -432,24 +458,27 @@ fn load_config_dir(dir: &Path) -> Result<ConfigSnapshot> {
     }
 
     let mut fingerprint_parts = Vec::new();
-    let mut merged = AppConfig {
-        defaults: DefaultsConfig::default(),
-        brokers: BTreeMap::new(),
-        tasks: Vec::new(),
-    };
+    let mut merged = ConfigFragment::default();
     let mut defaults_source: Option<PathBuf> = None;
+    let mut watch_source: Option<PathBuf> = None;
 
     for path in paths {
         let raw = fs::read_to_string(&path)?;
         fingerprint_parts.push(format!("FILE:{}\n{}", path.display(), raw));
-        let config = AppConfig::from_toml(&raw)?;
-        merge_config(&mut merged, config, &path, &mut defaults_source)?;
+        let config = ConfigFragment::from_toml(&raw)?;
+        merge_config(
+            &mut merged,
+            config,
+            &path,
+            &mut defaults_source,
+            &mut watch_source,
+        )?;
     }
 
-    merged.validate()?;
+    let config = AppConfig::from_fragment(merged)?;
 
     Ok(ConfigSnapshot {
-        config: merged,
+        config,
         fingerprint: fingerprint_parts.join("\n--\n"),
     })
 }
@@ -490,22 +519,29 @@ fn collect_toml_paths(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn merge_config(
-    merged: &mut AppConfig,
-    config: AppConfig,
+    merged: &mut ConfigFragment,
+    config: ConfigFragment,
     path: &Path,
     defaults_source: &mut Option<PathBuf>,
+    watch_source: &mut Option<PathBuf>,
 ) -> Result<()> {
-    if let Some(existing_source) = defaults_source.as_ref() {
-        if !defaults_equal(&merged.defaults, &config.defaults) {
-            return Err(TradeBotError::Config(format!(
-                "config dir has conflicting defaults between `{}` and `{}`",
-                existing_source.display(),
-                path.display()
-            )));
+    if let Some(defaults) = config.defaults {
+        if let Some(existing_source) = defaults_source.as_ref() {
+            let existing_defaults = merged
+                .defaults
+                .as_ref()
+                .expect("defaults_source implies merged defaults");
+            if !defaults_equal(existing_defaults, &defaults) {
+                return Err(TradeBotError::Config(format!(
+                    "config dir has conflicting defaults between `{}` and `{}`",
+                    existing_source.display(),
+                    path.display()
+                )));
+            }
+        } else {
+            merged.defaults = Some(defaults);
+            *defaults_source = Some(path.to_path_buf());
         }
-    } else {
-        merged.defaults = config.defaults.clone();
-        *defaults_source = Some(path.to_path_buf());
     }
 
     for (name, broker) in config.brokers {
@@ -519,6 +555,38 @@ fn merge_config(
             continue;
         }
         merged.brokers.insert(name, broker);
+    }
+
+    if let Some(watch) = config.watch {
+        if let Some(existing_source) = watch_source.as_ref() {
+            let existing_watch = merged
+                .watch
+                .as_ref()
+                .expect("watch_source implies merged watch config");
+            if !watch_configs_equal(existing_watch, &watch) {
+                return Err(TradeBotError::Config(format!(
+                    "config dir has conflicting watch config between `{}` and `{}`",
+                    existing_source.display(),
+                    path.display()
+                )));
+            }
+        } else {
+            merged.watch = Some(watch);
+            *watch_source = Some(path.to_path_buf());
+        }
+    }
+
+    for (name, template) in config.task_templates {
+        if let Some(existing) = merged.task_templates.get(&name) {
+            if existing != &template {
+                return Err(TradeBotError::Config(format!(
+                    "config dir has conflicting task template `{name}` in `{}`",
+                    path.display()
+                )));
+            }
+            continue;
+        }
+        merged.task_templates.insert(name, template);
     }
 
     for task in config.tasks {
@@ -552,6 +620,10 @@ fn broker_configs_equal(
     left.kind == right.kind
         && left.env_prefix == right.env_prefix
         && left.settings == right.settings
+}
+
+fn watch_configs_equal(left: &WatchConfig, right: &WatchConfig) -> bool {
+    left == right
 }
 
 fn email_defaults_equal(
@@ -941,7 +1013,146 @@ weight = 1.0
     }
 
     #[test]
-    fn scheduled_task_descriptions_omit_unscheduled_and_disabled_tasks() {
+    fn load_config_dir_supports_shared_template_file() {
+        let dir = temp_dir("template-file");
+        let shared = r#"[defaults]
+timezone = "UTC"
+default_tif = "day"
+
+[brokers.paper]
+kind = "ibkr"
+
+[task_templates.shared]
+broker = "paper"
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+"#;
+        let task = r#"[[tasks]]
+name = "task-a"
+template = "shared"
+
+[[tasks.symbols]]
+ticker = "AAPL"
+market = "us"
+conid = "265598"
+weight = 1.0
+"#;
+        fs::write(dir.join("shared.toml"), shared).unwrap();
+        fs::write(dir.join("task.toml"), task).unwrap();
+
+        let snapshot = load_config_dir(&dir).unwrap();
+        assert_eq!(snapshot.config.tasks.len(), 1);
+        assert_eq!(snapshot.config.tasks[0].broker, "paper");
+        assert_eq!(
+            snapshot.config.tasks[0].side,
+            Some(trading_core::OrderSide::Buy)
+        );
+    }
+
+    #[test]
+    fn load_config_dir_allows_duplicate_identical_templates() {
+        let dir = temp_dir("duplicate-template");
+        let shared = r#"[defaults]
+timezone = "UTC"
+default_tif = "day"
+
+[brokers.paper]
+kind = "ibkr"
+
+[task_templates.shared]
+broker = "paper"
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks]]
+name = "task-a"
+template = "shared"
+
+[[tasks.symbols]]
+ticker = "AAPL"
+market = "us"
+conid = "265598"
+weight = 1.0
+"#;
+        let duplicate_template = r#"[task_templates.shared]
+broker = "paper"
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks]]
+name = "task-b"
+template = "shared"
+
+[[tasks.symbols]]
+ticker = "MSFT"
+market = "us"
+conid = "272093"
+weight = 1.0
+"#;
+        fs::write(dir.join("a.toml"), shared).unwrap();
+        fs::write(dir.join("b.toml"), duplicate_template).unwrap();
+
+        let snapshot = load_config_dir(&dir).unwrap();
+        assert_eq!(snapshot.config.tasks.len(), 2);
+    }
+
+    #[test]
+    fn load_config_dir_rejects_conflicting_duplicate_templates() {
+        let dir = temp_dir("conflicting-template");
+        let shared = r#"[defaults]
+timezone = "UTC"
+default_tif = "day"
+
+[brokers.paper]
+kind = "ibkr"
+
+[task_templates.shared]
+broker = "paper"
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks]]
+name = "task-a"
+template = "shared"
+
+[[tasks.symbols]]
+ticker = "AAPL"
+market = "us"
+conid = "265598"
+weight = 1.0
+"#;
+        let conflicting_template = r#"[task_templates.shared]
+broker = "paper"
+side = "sell"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks]]
+name = "task-b"
+template = "shared"
+
+[[tasks.symbols]]
+ticker = "MSFT"
+market = "us"
+conid = "272093"
+weight = 1.0
+"#;
+        fs::write(dir.join("a.toml"), shared).unwrap();
+        fs::write(dir.join("b.toml"), conflicting_template).unwrap();
+
+        let err = load_config_dir(&dir).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("conflicting task template `shared`")
+        );
+    }
+
+    #[test]
+    fn scheduled_task_descriptions_include_disabled_but_omit_manual_tasks() {
         let raw = r#"[defaults]
 timezone = "UTC"
 
@@ -992,11 +1203,15 @@ weight = 1.0
         let config = AppConfig::from_toml(raw).unwrap();
 
         let descriptions = scheduled_task_descriptions(&config);
-        assert_eq!(descriptions.len(), 1);
-        assert!(descriptions[0].contains("scheduled-a"));
-        assert!(descriptions[0].contains("overdue=skip"));
-        assert!(!descriptions[0].contains("manual-b"));
-        assert!(!descriptions[0].contains("disabled-c"));
+        assert_eq!(descriptions.len(), 2);
+        assert_eq!(descriptions[0].status_label(), "active");
+        assert!(descriptions[0].description.contains("scheduled-a"));
+        assert!(descriptions[0].description.contains("status=enabled"));
+        assert!(descriptions[0].description.contains("overdue=skip"));
+        assert_eq!(descriptions[1].status_label(), "disabled");
+        assert!(descriptions[1].description.contains("disabled-c"));
+        assert!(descriptions[1].description.contains("status=disabled"));
+        assert!(!descriptions[1].description.contains("manual-b"));
     }
 
     #[test]

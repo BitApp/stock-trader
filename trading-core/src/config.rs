@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use chrono::{NaiveTime, Weekday};
 use chrono_tz::Tz;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     errors::{Result, TradeBotError},
@@ -12,15 +12,15 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AppConfig {
-    #[serde(default)]
     pub defaults: DefaultsConfig,
+    pub watch: WatchConfig,
     pub brokers: BTreeMap<String, BrokerConfig>,
     pub tasks: Vec<TaskConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DefaultsConfig {
     #[serde(default = "default_timezone")]
     pub timezone: String,
@@ -40,13 +40,13 @@ impl Default for DefaultsConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmailTransportConfig {
     #[serde(default)]
     pub subject_prefix: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrokerConfig {
     pub kind: String,
     #[serde(default)]
@@ -76,7 +76,7 @@ impl BrokerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TaskConfig {
     pub name: String,
     pub broker: String,
@@ -110,20 +110,46 @@ pub struct TaskConfig {
     pub symbols: Vec<SymbolTarget>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WatchConfig {
+    #[serde(default)]
+    pub notify: Option<WatchNotificationConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchNotificationConfig {
+    #[serde(default)]
+    pub email: Option<WatchEmailNotificationConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchEmailNotificationConfig {
+    pub to: Vec<String>,
+    #[serde(default = "default_watch_notification_events")]
+    pub on: Vec<WatchNotificationEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchNotificationEvent {
+    TaskListLoaded,
+    TaskListChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskNotificationConfig {
     #[serde(default)]
     pub email: Option<EmailNotificationConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmailNotificationConfig {
     pub to: Vec<String>,
     #[serde(default = "default_notification_events")]
     pub on: Vec<NotificationEvent>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationEvent {
     Success,
@@ -132,7 +158,7 @@ pub enum NotificationEvent {
     PartialFilled,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskScheduleConfig {
     #[serde(default)]
     pub date: Option<String>,
@@ -145,7 +171,7 @@ pub struct TaskScheduleConfig {
     pub overdue_policy: ScheduleOverduePolicy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScheduleWeekday {
     Mon,
@@ -157,11 +183,68 @@ pub enum ScheduleWeekday {
     Sun,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScheduleOverduePolicy {
     Run,
     Skip,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ConfigFragment {
+    #[serde(default)]
+    pub defaults: Option<DefaultsConfig>,
+    #[serde(default)]
+    pub watch: Option<WatchConfig>,
+    #[serde(default)]
+    pub brokers: BTreeMap<String, BrokerConfig>,
+    #[serde(default)]
+    pub task_templates: BTreeMap<String, TaskFieldsConfig>,
+    #[serde(default)]
+    pub tasks: Vec<RawTaskConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct RawTaskConfig {
+    pub name: String,
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(flatten)]
+    pub fields: TaskFieldsConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct TaskFieldsConfig {
+    #[serde(default)]
+    pub broker: Option<String>,
+    #[serde(default)]
+    pub action: Option<TaskAction>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub schedule: Option<TaskScheduleConfig>,
+    #[serde(default)]
+    pub execution: Option<ExecutionPolicy>,
+    #[serde(default)]
+    pub notify: Option<TaskNotificationConfig>,
+    #[serde(default)]
+    pub side: Option<OrderSide>,
+    #[serde(default)]
+    pub pricing: Option<PricingSpec>,
+    #[serde(default)]
+    pub risk: Option<RiskPolicy>,
+    #[serde(default)]
+    pub session: Option<SessionPolicy>,
+    #[serde(default)]
+    pub shared_budget: Option<SharedBudget>,
+    #[serde(default)]
+    pub time_in_force: Option<TimeInForce>,
+    #[serde(default)]
+    pub client_tag: Option<String>,
+    #[serde(default)]
+    pub all_open: Option<bool>,
+    #[serde(default)]
+    pub symbols: Option<Vec<SymbolTarget>>,
 }
 
 impl AppConfig {
@@ -171,9 +254,12 @@ impl AppConfig {
     }
 
     pub fn from_toml(raw: &str) -> Result<Self> {
-        let parsed: Self = toml::from_str(raw)?;
-        parsed.validate()?;
-        Ok(parsed)
+        let fragment = ConfigFragment::from_toml(raw)?;
+        Self::from_fragment(fragment)
+    }
+
+    pub fn from_fragment(fragment: ConfigFragment) -> Result<Self> {
+        fragment.into_app_config()
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -188,6 +274,8 @@ impl AppConfig {
         for (broker_name, broker) in &self.brokers {
             broker.validate(broker_name)?;
         }
+
+        self.watch.validate(&self.defaults)?;
 
         if self.tasks.is_empty() {
             return Err(TradeBotError::Config(
@@ -380,6 +468,31 @@ impl AppConfig {
     }
 }
 
+impl ConfigFragment {
+    pub fn from_toml(raw: &str) -> Result<Self> {
+        Ok(toml::from_str(raw)?)
+    }
+
+    pub fn into_app_config(self) -> Result<AppConfig> {
+        let defaults = self.defaults.unwrap_or_default();
+        let watch = self.watch.unwrap_or_default();
+        let templates = self.task_templates;
+        let tasks = self
+            .tasks
+            .into_iter()
+            .map(|task| task.expand(&templates))
+            .collect::<Result<Vec<_>>>()?;
+        let config = AppConfig {
+            defaults,
+            watch,
+            brokers: self.brokers,
+            tasks,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
 fn default_tif() -> TimeInForce {
     TimeInForce::Day
 }
@@ -402,6 +515,108 @@ fn default_overdue_policy() -> ScheduleOverduePolicy {
 
 fn default_notification_events() -> Vec<NotificationEvent> {
     vec![NotificationEvent::Success]
+}
+
+fn default_watch_notification_events() -> Vec<WatchNotificationEvent> {
+    vec![
+        WatchNotificationEvent::TaskListLoaded,
+        WatchNotificationEvent::TaskListChanged,
+    ]
+}
+
+impl RawTaskConfig {
+    fn expand(self, templates: &BTreeMap<String, TaskFieldsConfig>) -> Result<TaskConfig> {
+        let mut fields = self
+            .template
+            .as_deref()
+            .map(|template_name| {
+                templates.get(template_name).cloned().ok_or_else(|| {
+                    TradeBotError::Config(format!(
+                        "task `{}` references unknown template `{template_name}`",
+                        self.name
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        fields.apply_overrides(self.fields);
+        fields.into_task(self.name)
+    }
+}
+
+impl TaskFieldsConfig {
+    fn apply_overrides(&mut self, overrides: TaskFieldsConfig) {
+        if let Some(value) = overrides.broker {
+            self.broker = Some(value);
+        }
+        if let Some(value) = overrides.action {
+            self.action = Some(value);
+        }
+        if let Some(value) = overrides.note {
+            self.note = Some(value);
+        }
+        if let Some(value) = overrides.schedule {
+            self.schedule = Some(value);
+        }
+        if let Some(value) = overrides.execution {
+            self.execution = Some(value);
+        }
+        if let Some(value) = overrides.notify {
+            self.notify = Some(value);
+        }
+        if let Some(value) = overrides.side {
+            self.side = Some(value);
+        }
+        if let Some(value) = overrides.pricing {
+            self.pricing = Some(value);
+        }
+        if let Some(value) = overrides.risk {
+            self.risk = Some(value);
+        }
+        if let Some(value) = overrides.session {
+            self.session = Some(value);
+        }
+        if let Some(value) = overrides.shared_budget {
+            self.shared_budget = Some(value);
+        }
+        if let Some(value) = overrides.time_in_force {
+            self.time_in_force = Some(value);
+        }
+        if let Some(value) = overrides.client_tag {
+            self.client_tag = Some(value);
+        }
+        if let Some(value) = overrides.all_open {
+            self.all_open = Some(value);
+        }
+        if let Some(value) = overrides.symbols {
+            self.symbols = Some(value);
+        }
+    }
+
+    fn into_task(self, name: String) -> Result<TaskConfig> {
+        let broker = self.broker.ok_or_else(|| {
+            TradeBotError::Config(format!("task `{name}` requires broker or template broker"))
+        })?;
+
+        Ok(TaskConfig {
+            name,
+            broker,
+            action: self.action.unwrap_or(default_task_action()),
+            note: self.note,
+            schedule: self.schedule,
+            execution: self.execution,
+            notify: self.notify,
+            side: self.side,
+            pricing: self.pricing,
+            risk: self.risk,
+            session: self.session,
+            shared_budget: self.shared_budget,
+            time_in_force: self.time_in_force,
+            client_tag: self.client_tag,
+            all_open: self.all_open.unwrap_or(false),
+            symbols: self.symbols.unwrap_or_default(),
+        })
+    }
 }
 
 fn validate_symbol_trade_constraints(task_name: &str, symbol: &SymbolTarget) -> Result<()> {
@@ -637,6 +852,56 @@ impl TaskNotificationConfig {
     }
 }
 
+impl WatchConfig {
+    fn validate(&self, _defaults: &DefaultsConfig) -> Result<()> {
+        let Some(notify) = &self.notify else {
+            return Ok(());
+        };
+        notify.validate()
+    }
+}
+
+impl WatchNotificationConfig {
+    fn validate(&self) -> Result<()> {
+        let Some(email) = &self.email else {
+            return Ok(());
+        };
+
+        if email.to.is_empty() {
+            return Err(TradeBotError::Config(
+                "watch.notify.email.to must contain at least one recipient".into(),
+            ));
+        }
+
+        for recipient in &email.to {
+            if !looks_like_email(recipient) {
+                return Err(TradeBotError::Config(format!(
+                    "watch.notify.email recipient `{recipient}` is not a valid email address"
+                )));
+            }
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        for event in &email.on {
+            if !seen.insert(*event) {
+                return Err(TradeBotError::Config(format!(
+                    "watch.notify.email has duplicate event `{}`",
+                    watch_notification_event_as_str(*event)
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn watch_notification_event_as_str(event: WatchNotificationEvent) -> &'static str {
+    match event {
+        WatchNotificationEvent::TaskListLoaded => "task_list_loaded",
+        WatchNotificationEvent::TaskListChanged => "task_list_changed",
+    }
+}
+
 fn looks_like_email(raw: &str) -> bool {
     let trimmed = raw.trim();
     !trimmed.is_empty() && trimmed.contains('@')
@@ -656,7 +921,8 @@ mod tests {
 
     use super::{
         AppConfig, BrokerConfig, DefaultsConfig, EmailNotificationConfig, NotificationEvent,
-        ScheduleOverduePolicy, TaskConfig, TaskNotificationConfig, TaskScheduleConfig,
+        ScheduleOverduePolicy, TaskConfig, TaskNotificationConfig, TaskScheduleConfig, WatchConfig,
+        WatchEmailNotificationConfig, WatchNotificationConfig, WatchNotificationEvent,
     };
     use crate::{
         errors::TradeBotError,
@@ -712,6 +978,7 @@ mod tests {
     fn sample_config(task: TaskConfig) -> AppConfig {
         AppConfig {
             defaults: DefaultsConfig::default(),
+            watch: WatchConfig::default(),
             brokers: BTreeMap::from([(
                 "paper".into(),
                 BrokerConfig {
@@ -792,6 +1059,122 @@ weight = 1.0
 
         let config = AppConfig::from_toml(raw).unwrap();
         assert_eq!(config.tasks[0].action, TaskAction::Place);
+    }
+
+    #[test]
+    fn task_template_populates_shared_fields() {
+        let raw = r#"[defaults]
+timezone = "UTC"
+
+[brokers.paper]
+kind = "ibkr"
+
+[task_templates.swing]
+broker = "paper"
+client_tag = "template-tag"
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+notify = { email = { to = ["ops@example.com"], on = ["success", "failure"] } }
+
+[[tasks]]
+name = "buy-aapl"
+template = "swing"
+
+[[tasks.symbols]]
+ticker = "AAPL"
+market = "us"
+weight = 1.0
+"#;
+
+        let config = AppConfig::from_toml(raw).unwrap();
+        let task = &config.tasks[0];
+        assert_eq!(task.broker, "paper");
+        assert_eq!(task.client_tag.as_deref(), Some("template-tag"));
+        assert_eq!(task.side, Some(OrderSide::Buy));
+        assert!(matches!(task.pricing, Some(PricingSpec::Counterparty)));
+        assert!(task.notify.is_some());
+    }
+
+    #[test]
+    fn task_fields_override_template_and_replace_arrays() {
+        let raw = r#"[defaults]
+timezone = "UTC"
+
+[brokers.paper]
+kind = "ibkr"
+
+[task_templates.base]
+broker = "paper"
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[task_templates.base.symbols]]
+ticker = "AAPL"
+market = "us"
+weight = 1.0
+
+[[tasks]]
+name = "buy-msft"
+template = "base"
+side = "sell"
+
+[[tasks.symbols]]
+ticker = "MSFT"
+market = "us"
+weight = 1.0
+"#;
+
+        let config = AppConfig::from_toml(raw).unwrap();
+        let task = &config.tasks[0];
+        assert_eq!(task.side, Some(OrderSide::Sell));
+        assert_eq!(task.symbols.len(), 1);
+        assert_eq!(task.symbols[0].instrument.ticker, "MSFT");
+        assert_eq!(task.symbols[0].weight, Some(1.0));
+    }
+
+    #[test]
+    fn rejects_unknown_task_template() {
+        let raw = r#"[defaults]
+timezone = "UTC"
+
+[brokers.paper]
+kind = "ibkr"
+
+[[tasks]]
+name = "buy-aapl"
+template = "missing"
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks.symbols]]
+ticker = "AAPL"
+market = "us"
+weight = 1.0
+"#;
+
+        let err = AppConfig::from_toml(raw).unwrap_err();
+        assert!(err.to_string().contains("unknown template `missing`"));
+    }
+
+    #[test]
+    fn accepts_watch_email_notification() {
+        let mut config = sample_config(sample_task());
+        config.watch = WatchConfig {
+            notify: Some(WatchNotificationConfig {
+                email: Some(WatchEmailNotificationConfig {
+                    to: vec!["ops@example.com".into()],
+                    on: vec![
+                        WatchNotificationEvent::TaskListLoaded,
+                        WatchNotificationEvent::TaskListChanged,
+                    ],
+                }),
+            }),
+        };
+
+        assert!(config.validate().is_ok());
     }
 
     #[test]

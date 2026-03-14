@@ -10,8 +10,8 @@ use serde_json::json;
 use tokio::runtime::Builder;
 use tracing::warn;
 use trading_core::{
-    AppConfig, EmailNotificationConfig, ExecutionResult, NotificationEvent, OrderResult,
-    TaskAction, TaskConfig,
+    AppConfig, ExecutionResult, NotificationEvent, OrderResult, TaskAction, TaskConfig,
+    WatchNotificationEvent,
 };
 
 const EMAIL_REGION_ENV: &str = "TRADEBOT_EMAIL_REGION";
@@ -21,6 +21,35 @@ pub struct NotificationPreview {
     pub subject: String,
     pub body: String,
     pub html_body: String,
+}
+
+#[derive(Debug)]
+struct TaskListCounts {
+    enabled: usize,
+    total: usize,
+}
+
+#[derive(Debug)]
+struct UpdatedTaskEntry {
+    name: String,
+    before: String,
+    after: String,
+}
+
+#[derive(Debug)]
+struct TaskListChangeDetails {
+    before: TaskListCounts,
+    after: TaskListCounts,
+    added: Vec<String>,
+    removed: Vec<String>,
+    updated: Vec<UpdatedTaskEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskDisplayState {
+    Active,
+    Disabled,
+    Manual,
 }
 
 pub fn notify_task_success(config: &AppConfig, task: &TaskConfig, result: &ExecutionResult) {
@@ -60,6 +89,36 @@ pub fn notify_task_failure(config: &AppConfig, task: &TaskConfig, error: &str) {
     dispatch_notification(
         task,
         NotificationEvent::Failure,
+        &subject,
+        &body,
+        &html_body,
+    );
+}
+
+pub fn notify_task_list_loaded(config: &AppConfig, source: &str) {
+    let subject = format_watch_subject(config, "task list loaded");
+    let body = format_task_list_loaded_body(config, source);
+    let html_body = format_task_list_loaded_html(config, source);
+    dispatch_watch_notification(
+        config,
+        WatchNotificationEvent::TaskListLoaded,
+        &subject,
+        &body,
+        &html_body,
+    );
+}
+
+pub fn notify_task_list_changed(previous: &AppConfig, current: &AppConfig, source: &str) {
+    let Some(details) = task_list_change_details(previous, current) else {
+        return;
+    };
+
+    let subject = format_watch_subject(current, "task list changed");
+    let body = format_task_list_changed_body(previous, current, source, &details);
+    let html_body = format_task_list_changed_html(previous, current, source, &details);
+    dispatch_watch_notification(
+        current,
+        WatchNotificationEvent::TaskListChanged,
         &subject,
         &body,
         &html_body,
@@ -131,7 +190,12 @@ pub fn send_preview_notification(
         })?;
 
     let preview = preview_notification(config, task, event, failure_error)?;
-    send_email_blocking(email, &preview.subject, &preview.body, &preview.html_body)?;
+    send_email_blocking(
+        &email.to,
+        &preview.subject,
+        &preview.body,
+        &preview.html_body,
+    )?;
     Ok(preview)
 }
 
@@ -153,7 +217,7 @@ fn dispatch_notification(
         return;
     }
 
-    if let Err(err) = send_email_blocking(email_config, subject, body, html_body) {
+    if let Err(err) = send_email_blocking(&email_config.to, subject, body, html_body) {
         warn!(
             task = %task.name,
             event = ?event,
@@ -164,8 +228,37 @@ fn dispatch_notification(
     }
 }
 
+fn dispatch_watch_notification(
+    config: &AppConfig,
+    event: WatchNotificationEvent,
+    subject: &str,
+    body: &str,
+    html_body: &str,
+) {
+    let Some(email_config) = config
+        .watch
+        .notify
+        .as_ref()
+        .and_then(|notify| notify.email.as_ref())
+    else {
+        return;
+    };
+    if !email_config.on.contains(&event) {
+        return;
+    }
+
+    if let Err(err) = send_email_blocking(&email_config.to, subject, body, html_body) {
+        warn!(
+            event = ?event,
+            recipients = %email_config.to.join(","),
+            error = %err,
+            "failed to send watch email notification"
+        );
+    }
+}
+
 fn send_email_blocking(
-    email: &EmailNotificationConfig,
+    recipients: &[String],
     subject: &str,
     body: &str,
     html_body: &str,
@@ -210,7 +303,7 @@ fn send_email_blocking(
             )
             .build();
         let destination = Destination::builder()
-            .set_to_addresses(Some(email.to.clone()))
+            .set_to_addresses(Some(recipients.to_vec()))
             .build();
         let content = EmailContent::builder().simple(message).build();
 
@@ -252,6 +345,17 @@ fn format_subject(config: &AppConfig, task: &TaskConfig, status: &str) -> String
         .map(|prefix| format!("{prefix} "))
         .unwrap_or_default();
     format!("{prefix}{} {}", task.name, status)
+}
+
+fn format_watch_subject(config: &AppConfig, status: &str) -> String {
+    let prefix = config
+        .defaults
+        .email
+        .as_ref()
+        .and_then(|email| email.subject_prefix.as_deref())
+        .map(|prefix| format!("{prefix} "))
+        .unwrap_or_default();
+    format!("{prefix}{status}")
 }
 
 fn format_success_body(config: &AppConfig, task: &TaskConfig, result: &ExecutionResult) -> String {
@@ -332,6 +436,93 @@ fn format_partial_filled_html(
         result,
         "partial_filled",
         "Task completed with partial fills.",
+    )
+}
+
+fn format_task_list_loaded_body(config: &AppConfig, source: &str) -> String {
+    let timestamp = timestamp_in_config_timezone(config);
+    let counts = task_list_counts(config);
+    let active = format_task_summary_lines(&tasks_with_state(&config.tasks, TaskDisplayState::Active));
+    let disabled =
+        format_task_summary_lines(&tasks_with_state(&config.tasks, TaskDisplayState::Disabled));
+    let manual = format_task_summary_lines(&tasks_with_state(&config.tasks, TaskDisplayState::Manual));
+
+    format!(
+        "Task list loaded.\n\nSummary\nTime: {timestamp}\nSource: {source}\nEnabled scheduled tasks: {}/{}\n\nActive scheduled tasks\n{active}\n\nDisabled scheduled tasks\n{disabled}\n\nManual tasks\n{manual}",
+        counts.enabled, counts.total
+    )
+}
+
+fn format_task_list_loaded_html(config: &AppConfig, source: &str) -> String {
+    let timestamp = timestamp_in_config_timezone(config);
+    let counts = task_list_counts(config);
+    let active_html =
+        format_task_summary_list_html(&tasks_with_state(&config.tasks, TaskDisplayState::Active));
+    let disabled_html =
+        format_task_summary_list_html(&tasks_with_state(&config.tasks, TaskDisplayState::Disabled));
+    let manual_html =
+        format_task_summary_list_html(&tasks_with_state(&config.tasks, TaskDisplayState::Manual));
+
+    format!(
+        "<!doctype html><html><body style=\"margin:0;padding:0;background:#f5f7fb;color:#132033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;\"><div style=\"max-width:760px;margin:0 auto;padding:24px 16px;\"><div style=\"background:#ffffff;border:1px solid #d8e0eb;border-radius:14px;padding:24px;\"><div style=\"font-size:13px;letter-spacing:0.08em;text-transform:uppercase;color:#7a8798;\">Tradebot</div><h1 style=\"margin:8px 0 20px;font-size:24px;line-height:1.3;\">Task list loaded</h1><table style=\"width:100%;border-collapse:collapse;font-size:14px;\"><tr><td style=\"padding:8px 0;color:#5f6b7a;width:180px;\">Time</td><td style=\"padding:8px 0;\">{timestamp}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Source</td><td style=\"padding:8px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;\">{source}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Enabled scheduled tasks</td><td style=\"padding:8px 0;\">{enabled}/{total}</td></tr></table><h2 style=\"margin:24px 0 8px;font-size:16px;color:#0f5c44;\">Active scheduled tasks</h2>{active_html}<h2 style=\"margin:24px 0 8px;font-size:16px;color:#7a5d00;\">Disabled scheduled tasks</h2>{disabled_html}<h2 style=\"margin:24px 0 8px;font-size:16px;color:#5f6b7a;\">Manual tasks</h2>{manual_html}</div></div></body></html>",
+        timestamp = html_escape(&timestamp),
+        source = html_escape(source),
+        enabled = counts.enabled,
+        total = counts.total,
+        active_html = active_html,
+        disabled_html = disabled_html,
+        manual_html = manual_html,
+    )
+}
+
+fn format_task_list_changed_body(
+    previous: &AppConfig,
+    current: &AppConfig,
+    source: &str,
+    details: &TaskListChangeDetails,
+) -> String {
+    let timestamp = timestamp_in_config_timezone(current);
+    let added = format_changed_task_lines(current, &details.added);
+    let removed = format_changed_task_lines(previous, &details.removed);
+    let updated = format_updated_task_lines(previous, current, &details.updated);
+
+    format!(
+        "Task list changed.\n\nSummary\nTime: {timestamp}\nSource: {source}\nBefore enabled scheduled tasks: {}/{}\nAfter enabled scheduled tasks: {}/{}\nAdded: {}\nRemoved: {}\nUpdated: {}\n\nAdded tasks\n{added}\n\nRemoved tasks\n{removed}\n\nUpdated tasks\n{updated}",
+        details.before.enabled,
+        details.before.total,
+        details.after.enabled,
+        details.after.total,
+        details.added.len(),
+        details.removed.len(),
+        details.updated.len(),
+    )
+}
+
+fn format_task_list_changed_html(
+    previous: &AppConfig,
+    current: &AppConfig,
+    source: &str,
+    details: &TaskListChangeDetails,
+) -> String {
+    let timestamp = timestamp_in_config_timezone(current);
+    let added_html = format_changed_task_list_html(current, &details.added);
+    let removed_html = format_changed_task_list_html(previous, &details.removed);
+    let updated_html = format_updated_task_list_html(previous, current, &details.updated);
+
+    format!(
+        "<!doctype html><html><body style=\"margin:0;padding:0;background:#f5f7fb;color:#132033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;\"><div style=\"max-width:760px;margin:0 auto;padding:24px 16px;\"><div style=\"background:#ffffff;border:1px solid #d8e0eb;border-radius:14px;padding:24px;\"><div style=\"font-size:13px;letter-spacing:0.08em;text-transform:uppercase;color:#7a8798;\">Tradebot</div><h1 style=\"margin:8px 0 20px;font-size:24px;line-height:1.3;\">Task list changed</h1><table style=\"width:100%;border-collapse:collapse;font-size:14px;\"><tr><td style=\"padding:8px 0;color:#5f6b7a;width:180px;\">Time</td><td style=\"padding:8px 0;\">{timestamp}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Source</td><td style=\"padding:8px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;\">{source}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Before enabled scheduled tasks</td><td style=\"padding:8px 0;\">{before_enabled}/{before_total}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">After enabled scheduled tasks</td><td style=\"padding:8px 0;\">{after_enabled}/{after_total}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Added</td><td style=\"padding:8px 0;\">{added_count}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Removed</td><td style=\"padding:8px 0;\">{removed_count}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Updated</td><td style=\"padding:8px 0;\">{updated_count}</td></tr></table><h2 style=\"margin:24px 0 8px;font-size:16px;\">Added tasks</h2>{added_html}<h2 style=\"margin:24px 0 8px;font-size:16px;\">Removed tasks</h2>{removed_html}<h2 style=\"margin:24px 0 8px;font-size:16px;\">Updated tasks</h2>{updated_html}</div></div></body></html>",
+        timestamp = html_escape(&timestamp),
+        source = html_escape(source),
+        before_enabled = details.before.enabled,
+        before_total = details.before.total,
+        after_enabled = details.after.enabled,
+        after_total = details.after.total,
+        added_count = details.added.len(),
+        removed_count = details.removed.len(),
+        updated_count = details.updated.len(),
+        added_html = added_html,
+        removed_html = removed_html,
+        updated_html = updated_html,
     )
 }
 
@@ -516,6 +707,348 @@ fn html_escape(raw: impl AsRef<str>) -> String {
         .replace('\'', "&#39;")
 }
 
+fn task_list_change_details(
+    previous: &AppConfig,
+    current: &AppConfig,
+) -> Option<TaskListChangeDetails> {
+    let previous_tasks = previous
+        .tasks
+        .iter()
+        .map(|task| (task.name.clone(), task.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let current_tasks = current
+        .tasks
+        .iter()
+        .map(|task| (task.name.clone(), task.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut updated = Vec::new();
+
+    for (name, current_task) in &current_tasks {
+        match previous_tasks.get(name) {
+            None => added.push(name.clone()),
+            Some(previous_task) if previous_task != current_task => {
+                updated.push(UpdatedTaskEntry {
+                    name: name.clone(),
+                    before: pretty_task_json(previous_task),
+                    after: pretty_task_json(current_task),
+                })
+            }
+            Some(_) => {}
+        }
+    }
+
+    for name in previous_tasks.keys() {
+        if !current_tasks.contains_key(name) {
+            removed.push(name.clone());
+        }
+    }
+
+    if added.is_empty() && removed.is_empty() && updated.is_empty() {
+        return None;
+    }
+
+    Some(TaskListChangeDetails {
+        before: task_list_counts(previous),
+        after: task_list_counts(current),
+        added,
+        removed,
+        updated,
+    })
+}
+
+fn task_list_counts(config: &AppConfig) -> TaskListCounts {
+    TaskListCounts {
+        enabled: config
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.schedule
+                    .as_ref()
+                    .is_some_and(|schedule| schedule.enabled)
+            })
+            .count(),
+        total: config.tasks.len(),
+    }
+}
+
+fn pretty_task_json(task: &TaskConfig) -> String {
+    serde_json::to_string_pretty(task)
+        .unwrap_or_else(|_| "{\"error\":\"failed to serialize task config\"}".into())
+}
+
+fn task_display_state(task: &TaskConfig) -> TaskDisplayState {
+    match task.schedule.as_ref() {
+        Some(schedule) if schedule.enabled => TaskDisplayState::Active,
+        Some(_) => TaskDisplayState::Disabled,
+        None => TaskDisplayState::Manual,
+    }
+}
+
+fn tasks_with_state(tasks: &[TaskConfig], state: TaskDisplayState) -> Vec<TaskConfig> {
+    tasks.iter()
+        .filter(|task| task_display_state(task) == state)
+        .cloned()
+        .collect()
+}
+
+fn format_task_summary_lines(tasks: &[TaskConfig]) -> String {
+    if tasks.is_empty() {
+        return "- none".into();
+    }
+
+    tasks
+        .iter()
+        .map(|task| {
+            let schedule = task
+                .schedule
+                .as_ref()
+                .map(format_task_schedule_summary)
+                .unwrap_or_else(|| "manual".into());
+            format!(
+                "- [{}] {} | broker={} | action={} | {}",
+                task_state_label(task_display_state(task)),
+                task.name,
+                task.broker,
+                format_action(task.action),
+                schedule
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_task_summary_list_html(tasks: &[TaskConfig]) -> String {
+    if tasks.is_empty() {
+        return "<div style=\"padding:16px;background:#f7f9fc;border:1px solid #d8e0eb;border-radius:10px;color:#5f6b7a;\">None</div>".into();
+    }
+
+    let items = tasks
+        .iter()
+        .map(format_task_summary_card_html)
+        .collect::<Vec<_>>()
+        .join("");
+    format!("<div>{items}</div>")
+}
+
+fn format_changed_task_lines(config: &AppConfig, names: &[String]) -> String {
+    if names.is_empty() {
+        return "- none".into();
+    }
+
+    names
+        .iter()
+        .map(|name| {
+            config
+                .tasks
+                .iter()
+                .find(|task| task.name == *name)
+                .map(format_task_summary_line)
+                .unwrap_or_else(|| format!("- {name}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_changed_task_list_html(config: &AppConfig, names: &[String]) -> String {
+    if names.is_empty() {
+        return "<div style=\"padding:16px;background:#f7f9fc;border:1px solid #d8e0eb;border-radius:10px;color:#5f6b7a;\">None</div>".into();
+    }
+
+    names
+        .iter()
+        .map(|name| {
+            config
+                .tasks
+                .iter()
+                .find(|task| task.name == *name)
+                .map(format_task_summary_card_html)
+                .unwrap_or_else(|| {
+                    format!(
+                        "<div style=\"margin:0 0 12px;padding:14px 16px;background:#f7f9fc;border:1px solid #d8e0eb;border-radius:12px;\">{}</div>",
+                        html_escape(name)
+                    )
+                })
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn format_updated_task_lines(
+    previous: &AppConfig,
+    current: &AppConfig,
+    updated: &[UpdatedTaskEntry],
+) -> String {
+    if updated.is_empty() {
+        return "- none".into();
+    }
+
+    updated
+        .iter()
+        .map(|entry| {
+            let before_state = previous
+                .tasks
+                .iter()
+                .find(|task| task.name == entry.name)
+                .map(task_display_state)
+                .unwrap_or(TaskDisplayState::Manual);
+            let after_state = current
+                .tasks
+                .iter()
+                .find(|task| task.name == entry.name)
+                .map(task_display_state)
+                .unwrap_or(TaskDisplayState::Manual);
+            format!(
+                "- {} | state: {} -> {}\n  Before\n{}\n  After\n{}",
+                entry.name,
+                task_state_label(before_state),
+                task_state_label(after_state),
+                entry.before,
+                entry.after
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn format_updated_task_list_html(
+    previous: &AppConfig,
+    current: &AppConfig,
+    updated: &[UpdatedTaskEntry],
+) -> String {
+    if updated.is_empty() {
+        return "<div style=\"padding:16px;background:#f7f9fc;border:1px solid #d8e0eb;border-radius:10px;color:#5f6b7a;\">None</div>".into();
+    }
+
+    updated
+        .iter()
+        .map(|entry| {
+            let before_state = previous
+                .tasks
+                .iter()
+                .find(|task| task.name == entry.name)
+                .map(task_display_state)
+                .unwrap_or(TaskDisplayState::Manual);
+            let after_state = current
+                .tasks
+                .iter()
+                .find(|task| task.name == entry.name)
+                .map(task_display_state)
+                .unwrap_or(TaskDisplayState::Manual);
+            format!(
+                "<div style=\"margin:0 0 16px;padding:16px;background:#f7f9fc;border:1px solid #d8e0eb;border-radius:10px;\"><div style=\"display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px;\"><div style=\"font-weight:600;\">{}</div><div><span style=\"{}\">{}</span><span style=\"margin:0 6px;color:#7a8798;\">-></span><span style=\"{}\">{}</span></div></div><div style=\"font-size:12px;color:#5f6b7a;margin-bottom:6px;\">Before</div><pre style=\"margin:0 0 12px;padding:12px;background:#0f172a;color:#e2e8f0;border-radius:10px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;\">{}</pre><div style=\"font-size:12px;color:#5f6b7a;margin-bottom:6px;\">After</div><pre style=\"margin:0;padding:12px;background:#0f172a;color:#e2e8f0;border-radius:10px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;\">{}</pre></div>",
+                html_escape(&entry.name),
+                task_state_badge_style(before_state),
+                html_escape(task_state_label(before_state)),
+                task_state_badge_style(after_state),
+                html_escape(task_state_label(after_state)),
+                html_escape(&entry.before),
+                html_escape(&entry.after),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn format_task_summary_line(task: &TaskConfig) -> String {
+    let schedule = task
+        .schedule
+        .as_ref()
+        .map(format_task_schedule_summary)
+        .unwrap_or_else(|| "manual".into());
+    format!(
+        "- [{}] {} | broker={} | action={} | {}",
+        task_state_label(task_display_state(task)),
+        task.name,
+        task.broker,
+        format_action(task.action),
+        schedule
+    )
+}
+
+fn format_task_summary_card_html(task: &TaskConfig) -> String {
+    let state = task_display_state(task);
+    let schedule = task
+        .schedule
+        .as_ref()
+        .map(format_task_schedule_summary)
+        .unwrap_or_else(|| "manual".into());
+    format!(
+        "<div style=\"margin:0 0 12px;padding:14px 16px;{}\"><div style=\"display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:8px;\"><strong>{}</strong><span style=\"{}\">{}</span></div><div style=\"font-size:13px;color:#2d3a4b;\">broker={} | action={}</div><div style=\"margin-top:6px;font-size:13px;color:#5f6b7a;\">{}</div></div>",
+        task_state_card_style(state),
+        html_escape(&task.name),
+        task_state_badge_style(state),
+        html_escape(task_state_label(state)),
+        html_escape(&task.broker),
+        html_escape(format_action(task.action)),
+        html_escape(schedule),
+    )
+}
+
+fn task_state_label(state: TaskDisplayState) -> &'static str {
+    match state {
+        TaskDisplayState::Active => "active",
+        TaskDisplayState::Disabled => "disabled",
+        TaskDisplayState::Manual => "manual",
+    }
+}
+
+fn task_state_card_style(state: TaskDisplayState) -> &'static str {
+    match state {
+        TaskDisplayState::Active => {
+            "background:#f1fbf6;border:1px solid #b8e3c8;border-radius:12px;"
+        }
+        TaskDisplayState::Disabled => {
+            "background:#fbf7ef;border:1px solid #e8d7a7;border-radius:12px;opacity:0.85;"
+        }
+        TaskDisplayState::Manual => {
+            "background:#f7f9fc;border:1px solid #d8e0eb;border-radius:12px;"
+        }
+    }
+}
+
+fn task_state_badge_style(state: TaskDisplayState) -> &'static str {
+    match state {
+        TaskDisplayState::Active => {
+            "display:inline-block;padding:4px 10px;border-radius:999px;background:#dff5e6;color:#0f5c44;font-size:12px;font-weight:600;"
+        }
+        TaskDisplayState::Disabled => {
+            "display:inline-block;padding:4px 10px;border-radius:999px;background:#f4e6bf;color:#7a5d00;font-size:12px;font-weight:600;"
+        }
+        TaskDisplayState::Manual => {
+            "display:inline-block;padding:4px 10px;border-radius:999px;background:#e9eef5;color:#516174;font-size:12px;font-weight:600;"
+        }
+    }
+}
+
+fn format_task_schedule_summary(schedule: &trading_core::TaskScheduleConfig) -> String {
+    let date = schedule.date.as_deref().unwrap_or("any-date");
+    let weekdays = if schedule.weekdays.is_empty() {
+        "all-days".into()
+    } else {
+        schedule
+            .weekdays
+            .iter()
+            .map(|weekday| weekday.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    format!(
+        "{} {} ({}) enabled={} overdue={}",
+        date,
+        schedule.time,
+        weekdays,
+        schedule.enabled,
+        match schedule.overdue_policy {
+            trading_core::ScheduleOverduePolicy::Run => "run",
+            trading_core::ScheduleOverduePolicy::Skip => "skip",
+        }
+    )
+}
+
 fn task_result_is_filled(result: &ExecutionResult) -> bool {
     if result.action != TaskAction::Place || result.orders.is_empty() {
         return false;
@@ -656,10 +1189,15 @@ mod tests {
     use serde_json::json;
     use trading_core::{
         AppConfig, DefaultsConfig, ExecutionResult, InstrumentRef, Market, NotificationEvent,
-        OrderResult, SymbolTarget, TaskAction, TaskConfig,
+        OrderResult, SymbolTarget, TaskAction, TaskConfig, WatchConfig,
+        WatchEmailNotificationConfig, WatchNotificationConfig, WatchNotificationEvent,
     };
 
-    use super::{preview_notification, task_result_is_filled, task_result_is_partially_filled};
+    use super::{
+        format_task_list_changed_body, format_task_list_changed_html, format_task_list_loaded_body,
+        format_task_list_loaded_html, preview_notification, task_list_change_details,
+        task_result_is_filled, task_result_is_partially_filled,
+    };
 
     fn sample_order(status: &str, symbol: &str, filled_qty: Option<f64>) -> OrderResult {
         OrderResult {
@@ -731,6 +1269,7 @@ mod tests {
                     subject_prefix: Some("[stock-trader]".into()),
                 }),
             },
+            watch: trading_core::WatchConfig::default(),
             brokers: Default::default(),
             tasks: Vec::new(),
         };
@@ -784,5 +1323,228 @@ mod tests {
         assert!(preview.body.contains("\"status\": \"filled\""));
         assert!(preview.html_body.contains("<table"));
         assert!(preview.html_body.contains("All tracked orders filled."));
+    }
+
+    fn sample_watch_config() -> WatchConfig {
+        WatchConfig {
+            notify: Some(WatchNotificationConfig {
+                email: Some(WatchEmailNotificationConfig {
+                    to: vec!["ops@example.com".into()],
+                    on: vec![
+                        WatchNotificationEvent::TaskListLoaded,
+                        WatchNotificationEvent::TaskListChanged,
+                    ],
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn task_list_change_details_detects_added_removed_and_updated_tasks() {
+        let base_task = TaskConfig {
+            name: "alpha".into(),
+            broker: "paper".into(),
+            action: TaskAction::Place,
+            note: None,
+            schedule: None,
+            execution: None,
+            notify: None,
+            side: None,
+            pricing: None,
+            risk: None,
+            session: None,
+            shared_budget: None,
+            time_in_force: None,
+            client_tag: None,
+            all_open: false,
+            symbols: vec![],
+        };
+        let previous = AppConfig {
+            defaults: DefaultsConfig::default(),
+            watch: sample_watch_config(),
+            brokers: Default::default(),
+            tasks: vec![
+                base_task.clone(),
+                TaskConfig {
+                    name: "removed".into(),
+                    ..base_task.clone()
+                },
+            ],
+        };
+        let current = AppConfig {
+            defaults: DefaultsConfig::default(),
+            watch: sample_watch_config(),
+            brokers: Default::default(),
+            tasks: vec![
+                TaskConfig {
+                    client_tag: Some("updated".into()),
+                    ..base_task.clone()
+                },
+                TaskConfig {
+                    name: "added".into(),
+                    ..base_task
+                },
+            ],
+        };
+
+        let details = task_list_change_details(&previous, &current).unwrap();
+        assert_eq!(details.added, vec!["added"]);
+        assert_eq!(details.removed, vec!["removed"]);
+        assert_eq!(details.updated.len(), 1);
+        assert_eq!(details.updated[0].name, "alpha");
+    }
+
+    #[test]
+    fn task_list_change_details_returns_none_for_identical_tasks() {
+        let config = AppConfig {
+            defaults: DefaultsConfig::default(),
+            watch: sample_watch_config(),
+            brokers: Default::default(),
+            tasks: vec![],
+        };
+
+        assert!(task_list_change_details(&config, &config).is_none());
+    }
+
+    #[test]
+    fn task_list_loaded_formats_active_disabled_and_manual_sections() {
+        let base_task = TaskConfig {
+            name: "base".into(),
+            broker: "paper".into(),
+            action: TaskAction::Place,
+            note: None,
+            schedule: None,
+            execution: None,
+            notify: None,
+            side: Some(trading_core::OrderSide::Buy),
+            pricing: None,
+            risk: None,
+            session: None,
+            shared_budget: None,
+            time_in_force: None,
+            client_tag: None,
+            all_open: false,
+            symbols: vec![],
+        };
+        let config = AppConfig {
+            defaults: DefaultsConfig::default(),
+            watch: sample_watch_config(),
+            brokers: Default::default(),
+            tasks: vec![
+                TaskConfig {
+                    name: "active-task".into(),
+                    schedule: Some(trading_core::TaskScheduleConfig {
+                        date: None,
+                        time: "09:30".into(),
+                        weekdays: vec![trading_core::ScheduleWeekday::Mon],
+                        enabled: true,
+                        overdue_policy: trading_core::ScheduleOverduePolicy::Skip,
+                    }),
+                    ..base_task.clone()
+                },
+                TaskConfig {
+                    name: "disabled-task".into(),
+                    schedule: Some(trading_core::TaskScheduleConfig {
+                        date: None,
+                        time: "09:30".into(),
+                        weekdays: vec![trading_core::ScheduleWeekday::Mon],
+                        enabled: false,
+                        overdue_policy: trading_core::ScheduleOverduePolicy::Skip,
+                    }),
+                    ..base_task.clone()
+                },
+                TaskConfig {
+                    name: "manual-task".into(),
+                    ..base_task
+                },
+            ],
+        };
+
+        let body = format_task_list_loaded_body(&config, "config/oneshot-tasks/*.toml");
+        let html = format_task_list_loaded_html(&config, "config/oneshot-tasks/*.toml");
+
+        assert!(body.contains("Active scheduled tasks"));
+        assert!(body.contains("Disabled scheduled tasks"));
+        assert!(body.contains("Manual tasks"));
+        assert!(body.contains("[active] active-task"));
+        assert!(body.contains("[disabled] disabled-task"));
+        assert!(body.contains("[manual] manual-task"));
+
+        assert!(html.contains("Active scheduled tasks"));
+        assert!(html.contains("Disabled scheduled tasks"));
+        assert!(html.contains("Manual tasks"));
+        assert!(html.contains(">active<"));
+        assert!(html.contains(">disabled<"));
+        assert!(html.contains(">manual<"));
+    }
+
+    #[test]
+    fn task_list_changed_formats_state_transitions() {
+        let base_task = TaskConfig {
+            name: "task".into(),
+            broker: "paper".into(),
+            action: TaskAction::Place,
+            note: None,
+            schedule: None,
+            execution: None,
+            notify: None,
+            side: Some(trading_core::OrderSide::Buy),
+            pricing: None,
+            risk: None,
+            session: None,
+            shared_budget: None,
+            time_in_force: None,
+            client_tag: None,
+            all_open: false,
+            symbols: vec![],
+        };
+        let previous = AppConfig {
+            defaults: DefaultsConfig::default(),
+            watch: sample_watch_config(),
+            brokers: Default::default(),
+            tasks: vec![TaskConfig {
+                schedule: Some(trading_core::TaskScheduleConfig {
+                    date: None,
+                    time: "09:30".into(),
+                    weekdays: vec![trading_core::ScheduleWeekday::Mon],
+                    enabled: false,
+                    overdue_policy: trading_core::ScheduleOverduePolicy::Skip,
+                }),
+                ..base_task.clone()
+            }],
+        };
+        let current = AppConfig {
+            defaults: DefaultsConfig::default(),
+            watch: sample_watch_config(),
+            brokers: Default::default(),
+            tasks: vec![TaskConfig {
+                schedule: Some(trading_core::TaskScheduleConfig {
+                    date: None,
+                    time: "09:30".into(),
+                    weekdays: vec![trading_core::ScheduleWeekday::Mon],
+                    enabled: true,
+                    overdue_policy: trading_core::ScheduleOverduePolicy::Skip,
+                }),
+                ..base_task
+            }],
+        };
+
+        let details = task_list_change_details(&previous, &current).unwrap();
+        let body = format_task_list_changed_body(
+            &previous,
+            &current,
+            "config/oneshot-tasks/*.toml",
+            &details,
+        );
+        let html = format_task_list_changed_html(
+            &previous,
+            &current,
+            "config/oneshot-tasks/*.toml",
+            &details,
+        );
+
+        assert!(body.contains("state: disabled -> active"));
+        assert!(html.contains(">disabled<"));
+        assert!(html.contains(">active<"));
     }
 }

@@ -5,16 +5,18 @@ default_tif = "day"
 [defaults.email]
 subject_prefix = "[stock-trader]"
 
+[watch.notify.email]
+to = ["ops@example.com"]
+on = ["task_list_loaded", "task_list_changed"]
+
 [brokers.longbridge]
 kind = "longbridge"
 
 [brokers.ibkr]
 kind = "ibkr"
 
-[[tasks]]
-name = "ibkr_us_rebalance"
+[task_templates.ibkr_us_place]
 broker = "ibkr"
-action = "place"
 schedule = { time = "09:30", weekdays = ["mon", "tue", "wed", "thu", "fri"] }
 side = "buy"
 pricing = { kind = "counterparty" }
@@ -23,6 +25,10 @@ shared_budget = { amount = 10000.0 }
 risk = { allow_margin = true }
 client_tag = "pm2-us-rebalance"
 notify = { email = { to = ["ops@example.com"], on = ["success", "failure"] } }
+
+[[tasks]]
+name = "ibkr_us_rebalance"
+template = "ibkr_us_place"
 
 [[tasks.symbols]]
 ticker = "AAPL"
