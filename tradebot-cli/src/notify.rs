@@ -30,10 +30,16 @@ struct TaskListCounts {
 }
 
 #[derive(Debug)]
-struct UpdatedTaskEntry {
-    name: String,
+struct TaskFieldChange {
+    path: String,
     before: String,
     after: String,
+}
+
+#[derive(Debug)]
+struct UpdatedTaskEntry {
+    name: String,
+    changes: Vec<TaskFieldChange>,
 }
 
 #[derive(Debug)]
@@ -732,8 +738,7 @@ fn task_list_change_details(
             Some(previous_task) if previous_task != current_task => {
                 updated.push(UpdatedTaskEntry {
                     name: name.clone(),
-                    before: pretty_task_json(previous_task),
-                    after: pretty_task_json(current_task),
+                    changes: diff_task_fields(previous_task, current_task),
                 })
             }
             Some(_) => {}
@@ -772,11 +777,6 @@ fn task_list_counts(config: &AppConfig) -> TaskListCounts {
             .count(),
         total: config.tasks.len(),
     }
-}
-
-fn pretty_task_json(task: &TaskConfig) -> String {
-    serde_json::to_string_pretty(task)
-        .unwrap_or_else(|_| "{\"error\":\"failed to serialize task config\"}".into())
 }
 
 fn task_display_state(task: &TaskConfig) -> TaskDisplayState {
@@ -900,13 +900,13 @@ fn format_updated_task_lines(
                 .find(|task| task.name == entry.name)
                 .map(task_display_state)
                 .unwrap_or(TaskDisplayState::Manual);
+            let changes = format_field_change_lines(&entry.changes);
             format!(
-                "- {} | state: {} -> {}\n  Before\n{}\n  After\n{}",
+                "- {} | state: {} -> {}\n{}\n",
                 entry.name,
                 task_state_label(before_state),
                 task_state_label(after_state),
-                entry.before,
-                entry.after
+                changes
             )
         })
         .collect::<Vec<_>>()
@@ -937,19 +937,115 @@ fn format_updated_task_list_html(
                 .find(|task| task.name == entry.name)
                 .map(task_display_state)
                 .unwrap_or(TaskDisplayState::Manual);
+            let changes_html = format_field_change_list_html(&entry.changes);
             format!(
-                "<div style=\"margin:0 0 16px;padding:16px;background:#f7f9fc;border:1px solid #d8e0eb;border-radius:10px;\"><div style=\"display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px;\"><div style=\"font-weight:600;\">{}</div><div><span style=\"{}\">{}</span><span style=\"margin:0 6px;color:#7a8798;\">-></span><span style=\"{}\">{}</span></div></div><div style=\"font-size:12px;color:#5f6b7a;margin-bottom:6px;\">Before</div><pre style=\"margin:0 0 12px;padding:12px;background:#0f172a;color:#e2e8f0;border-radius:10px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;\">{}</pre><div style=\"font-size:12px;color:#5f6b7a;margin-bottom:6px;\">After</div><pre style=\"margin:0;padding:12px;background:#0f172a;color:#e2e8f0;border-radius:10px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;\">{}</pre></div>",
+                "<div style=\"margin:0 0 16px;padding:16px;background:#f7f9fc;border:1px solid #d8e0eb;border-radius:10px;\"><div style=\"display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px;\"><div style=\"font-weight:600;\">{}</div><div><span style=\"{}\">{}</span><span style=\"margin:0 6px;color:#7a8798;\">-></span><span style=\"{}\">{}</span></div></div>{}</div>",
                 html_escape(&entry.name),
                 task_state_badge_style(before_state),
                 html_escape(task_state_label(before_state)),
                 task_state_badge_style(after_state),
                 html_escape(task_state_label(after_state)),
-                html_escape(&entry.before),
-                html_escape(&entry.after),
+                changes_html,
             )
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn format_field_change_lines(changes: &[TaskFieldChange]) -> String {
+    if changes.is_empty() {
+        return "  - no field-level diff available".into();
+    }
+
+    changes
+        .iter()
+        .map(|change| {
+            format!(
+                "  - {}: {} -> {}",
+                change.path, change.before, change.after
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_field_change_list_html(changes: &[TaskFieldChange]) -> String {
+    if changes.is_empty() {
+        return "<div style=\"padding:12px;background:#ffffff;border:1px solid #d8e0eb;border-radius:10px;color:#5f6b7a;\">No field-level diff available.</div>".into();
+    }
+
+    let items = changes
+        .iter()
+        .map(|change| {
+            format!(
+                "<li style=\"margin:0 0 10px;\"><div style=\"font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#516174;margin-bottom:4px;\">{}</div><div><span style=\"display:inline-block;padding:3px 8px;border-radius:999px;background:#eef2f7;color:#415466;font-size:12px;\">{}</span><span style=\"margin:0 6px;color:#7a8798;\">-></span><span style=\"display:inline-block;padding:3px 8px;border-radius:999px;background:#e8f1ff;color:#174ea6;font-size:12px;\">{}</span></div></li>",
+                html_escape(&change.path),
+                html_escape(&change.before),
+                html_escape(&change.after),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!("<ul style=\"margin:0;padding-left:20px;\">{items}</ul>")
+}
+
+fn diff_task_fields(before: &TaskConfig, after: &TaskConfig) -> Vec<TaskFieldChange> {
+    let before = serde_json::to_value(before)
+        .unwrap_or_else(|_| serde_json::Value::String("serialization_error".into()));
+    let after = serde_json::to_value(after)
+        .unwrap_or_else(|_| serde_json::Value::String("serialization_error".into()));
+    let mut changes = Vec::new();
+    collect_value_changes(None, &before, &after, &mut changes);
+    changes
+}
+
+fn collect_value_changes(
+    path: Option<&str>,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+    changes: &mut Vec<TaskFieldChange>,
+) {
+    match (before, after) {
+        (serde_json::Value::Object(before_map), serde_json::Value::Object(after_map)) => {
+            let keys = before_map
+                .keys()
+                .chain(after_map.keys())
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            for key in keys {
+                let next_path = match path {
+                    Some(prefix) => format!("{prefix}.{key}"),
+                    None => key.clone(),
+                };
+                match (before_map.get(&key), after_map.get(&key)) {
+                    (Some(before_value), Some(after_value)) => {
+                        collect_value_changes(Some(&next_path), before_value, after_value, changes);
+                    }
+                    (Some(before_value), None) => changes.push(TaskFieldChange {
+                        path: next_path,
+                        before: compact_json(before_value),
+                        after: "removed".into(),
+                    }),
+                    (None, Some(after_value)) => changes.push(TaskFieldChange {
+                        path: next_path,
+                        before: "added".into(),
+                        after: compact_json(after_value),
+                    }),
+                    (None, None) => {}
+                }
+            }
+        }
+        _ if before != after => changes.push(TaskFieldChange {
+            path: path.unwrap_or("task").to_string(),
+            before: compact_json(before),
+            after: compact_json(after),
+        }),
+        _ => {}
+    }
+}
+
+fn compact_json(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"serialization_error\"".into())
 }
 
 fn format_task_summary_line(task: &TaskConfig) -> String {
