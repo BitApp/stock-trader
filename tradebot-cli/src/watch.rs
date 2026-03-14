@@ -65,8 +65,8 @@ enum WatchSource {
 impl WatchSource {
     fn from_args(config_path: Option<PathBuf>, config_dir: Option<PathBuf>) -> Result<Self> {
         match (config_path, config_dir) {
-            (Some(path), None) => Ok(Self::File(path)),
-            (None, Some(path)) => Ok(Self::Dir(path)),
+            (Some(path), None) => Ok(Self::File(resolve_watch_path(path)?)),
+            (None, Some(path)) => Ok(Self::Dir(resolve_watch_path(path)?)),
             (None, None) => Err(TradeBotError::Config(
                 "watch requires either --config or --config-dir".into(),
             )),
@@ -126,6 +126,14 @@ impl WatchSource {
                         .any(|changed| changed.parent() == Some(dir) || changed == dir)
             }
         }
+    }
+}
+
+fn resolve_watch_path(path: PathBuf) -> Result<PathBuf> {
+    match fs::canonicalize(&path) {
+        Ok(path) => Ok(path),
+        Err(_) if path.is_absolute() => Ok(path),
+        Err(_) => Ok(std::env::current_dir()?.join(path)),
     }
 }
 
@@ -595,11 +603,12 @@ mod tests {
     };
 
     use chrono::{NaiveDate, NaiveTime, Weekday};
+    use notify::{Event, EventKind};
     use trading_core::{AppConfig, ScheduleOverduePolicy, ScheduleWeekday, TaskScheduleConfig};
 
     use super::{
-        collect_toml_paths, load_config_dir, schedule_description, schedule_is_due,
-        scheduled_task_counts, scheduled_task_descriptions,
+        WatchSource, collect_toml_paths, load_config_dir, resolve_watch_path, schedule_description,
+        schedule_is_due, scheduled_task_counts, scheduled_task_descriptions,
     };
 
     fn weekday_only_schedule() -> TaskScheduleConfig {
@@ -776,6 +785,27 @@ weight = 1.0
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["a.toml", "b.toml"]);
+    }
+
+    #[test]
+    fn resolves_relative_watch_path_to_absolute_path() {
+        let relative = PathBuf::from("config/oneshot-tasks");
+        let resolved = resolve_watch_path(relative).unwrap();
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with("config/oneshot-tasks"));
+    }
+
+    #[test]
+    fn dir_watch_source_matches_absolute_event_paths() {
+        let dir = resolve_watch_path(PathBuf::from("config/oneshot-tasks")).unwrap();
+        let source = WatchSource::Dir(dir.clone());
+        let event = Event {
+            kind: EventKind::Any,
+            paths: vec![dir.join("qqq.toml")],
+            attrs: Default::default(),
+        };
+
+        assert!(source.should_reload_for_event(&event));
     }
 
     #[test]
