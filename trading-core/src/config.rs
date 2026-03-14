@@ -80,6 +80,7 @@ impl BrokerConfig {
 pub struct TaskConfig {
     pub name: String,
     pub broker: String,
+    #[serde(default = "default_task_action")]
     pub action: TaskAction,
     #[serde(default)]
     pub note: Option<String>,
@@ -381,6 +382,10 @@ impl AppConfig {
 
 fn default_tif() -> TimeInForce {
     TimeInForce::Day
+}
+
+fn default_task_action() -> TaskAction {
+    TaskAction::Place
 }
 
 fn default_timezone() -> String {
@@ -762,6 +767,31 @@ mod tests {
         assert!(
             matches!(err, TradeBotError::Config(message) if message.contains("env_prefix cannot be empty"))
         );
+    }
+
+    #[test]
+    fn defaults_missing_task_action_to_place() {
+        let raw = r#"[defaults]
+timezone = "UTC"
+
+[brokers.paper]
+kind = "ibkr"
+
+[[tasks]]
+name = "buy-aapl"
+broker = "paper"
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks.symbols]]
+ticker = "AAPL"
+market = "us"
+weight = 1.0
+"#;
+
+        let config = AppConfig::from_toml(raw).unwrap();
+        assert_eq!(config.tasks[0].action, TaskAction::Place);
     }
 
     #[test]

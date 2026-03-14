@@ -312,6 +312,9 @@ fn scheduled_task_descriptions(config: &AppConfig) -> Vec<String> {
         .iter()
         .filter_map(|task| {
             let schedule = task.schedule.as_ref()?;
+            if !schedule.enabled {
+                return None;
+            }
             Some(format!(
                 "{} [{} {:?}] {}",
                 task.name,
@@ -819,7 +822,7 @@ weight = 1.0
     }
 
     #[test]
-    fn scheduled_task_descriptions_omit_unscheduled_tasks() {
+    fn scheduled_task_descriptions_omit_unscheduled_and_disabled_tasks() {
         let raw = r#"[defaults]
 timezone = "UTC"
 
@@ -852,6 +855,20 @@ shared_budget = { amount = 1000.0 }
 ticker = "MSFT"
 market = "us"
 weight = 1.0
+
+[[tasks]]
+name = "disabled-c"
+broker = "paper"
+action = "place"
+schedule = { time = "09:30", weekdays = ["mon"], enabled = false }
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks.symbols]]
+ticker = "GOOG"
+market = "us"
+weight = 1.0
 "#;
         let config = AppConfig::from_toml(raw).unwrap();
 
@@ -860,6 +877,7 @@ weight = 1.0
         assert!(descriptions[0].contains("scheduled-a"));
         assert!(descriptions[0].contains("overdue_policy=skip"));
         assert!(!descriptions[0].contains("manual-b"));
+        assert!(!descriptions[0].contains("disabled-c"));
     }
 
     #[test]
