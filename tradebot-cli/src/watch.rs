@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::mpsc::{self, RecvTimeoutError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc, Weekday};
@@ -22,24 +22,29 @@ pub fn watch(
 ) -> Result<()> {
     let source = WatchSource::from_args(config_path, config_dir)?;
     let poll_interval = Duration::from_secs(poll_seconds.max(1));
+    let reload_debounce = Duration::from_secs(1);
     let mut state = WatchState::load(source.clone())?;
     let (_watcher, rx) = build_watcher(&source)?;
+    let mut pending_reload_at: Option<Instant> = None;
 
     info!(
         source = %source.display(),
         timezone = %state.schedule_timezone(),
         poll_seconds = poll_interval.as_secs(),
+        reload_debounce_seconds = reload_debounce.as_secs(),
         watch_root = %source.watch_root().display(),
         "watching config for scheduled tasks"
     );
     state.log_scheduled_tasks("loaded");
 
     loop {
-        match rx.recv_timeout(poll_interval) {
+        let now = Instant::now();
+        let wait = next_watch_wait(poll_interval, pending_reload_at, now);
+        match rx.recv_timeout(wait) {
             Ok(Ok(event)) => {
                 if source.should_reload_for_event(&event) {
                     drain_ready_events(&rx);
-                    state.reload_if_changed();
+                    pending_reload_at = Some(Instant::now() + reload_debounce);
                 }
             }
             Ok(Err(err)) => {
@@ -51,6 +56,10 @@ pub fn watch(
                     "file watcher disconnected unexpectedly".into(),
                 ));
             }
+        }
+        if pending_reload_at.is_some_and(|deadline| Instant::now() >= deadline) {
+            pending_reload_at = None;
+            state.reload_if_changed();
         }
         state.run_due_tasks();
     }
@@ -300,11 +309,16 @@ impl WatchState {
             timezone = %self.schedule_timezone(),
             enabled = enabled_count,
             total = total_count,
-            summary = %format!("{enabled_count}/{total_count}"),
-            "scheduled tasks {verb}"
+            "scheduled tasks {verb}: {enabled_count}/{total_count} enabled"
         );
-        for task in scheduled_tasks {
-            info!(source = %self.source.display(), task = %task, "scheduled task");
+        for (index, task) in scheduled_tasks.into_iter().enumerate() {
+            info!(
+                source = %self.source.display(),
+                "active task {}/{}: {}",
+                index + 1,
+                enabled_count,
+                task
+            );
         }
     }
 }
@@ -318,15 +332,20 @@ fn scheduled_task_descriptions(config: &AppConfig) -> Vec<String> {
             if !schedule.enabled {
                 return None;
             }
-            Some(format!(
-                "{} [{} {:?}] {}",
-                task.name,
-                task.broker,
-                task.action,
-                schedule_description(schedule)
-            ))
+            Some(format_active_scheduled_task(task, schedule))
         })
         .collect()
+}
+
+fn format_active_scheduled_task(task: &TaskConfig, schedule: &TaskScheduleConfig) -> String {
+    format!(
+        "{} | broker={} | action={} | {} | overdue={}",
+        task.name,
+        task.broker,
+        task_action_as_str(task.action),
+        schedule_when_description(schedule),
+        overdue_policy_as_str(schedule.overdue_policy)
+    )
 }
 
 fn scheduled_task_counts(config: &AppConfig) -> (usize, usize) {
@@ -341,6 +360,25 @@ fn scheduled_task_counts(config: &AppConfig) -> (usize, usize) {
         })
         .count();
     (enabled, total)
+}
+
+fn schedule_when_description(schedule: &TaskScheduleConfig) -> String {
+    let weekday_summary = if schedule.weekdays.is_empty() {
+        "all-days".to_string()
+    } else {
+        schedule
+            .weekdays
+            .iter()
+            .map(|weekday| weekday.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let date_summary = schedule.date.as_deref().unwrap_or("any-date");
+
+    format!(
+        "when={} {} ({})",
+        date_summary, schedule.time, weekday_summary
+    )
 }
 
 fn schedule_description(schedule: &TaskScheduleConfig) -> String {
@@ -373,6 +411,13 @@ fn overdue_policy_as_str(policy: ScheduleOverduePolicy) -> &'static str {
     match policy {
         ScheduleOverduePolicy::Run => "run",
         ScheduleOverduePolicy::Skip => "skip",
+    }
+}
+
+fn task_action_as_str(action: trading_core::TaskAction) -> &'static str {
+    match action {
+        trading_core::TaskAction::Place => "place",
+        trading_core::TaskAction::Cancel => "cancel",
     }
 }
 
@@ -553,6 +598,16 @@ fn latest_boundary(
     }
 }
 
+fn next_watch_wait(
+    poll_interval: Duration,
+    pending_reload_at: Option<Instant>,
+    now: Instant,
+) -> Duration {
+    pending_reload_at
+        .map(|deadline| deadline.saturating_duration_since(now).min(poll_interval))
+        .unwrap_or(poll_interval)
+}
+
 fn schedule_is_due(
     schedule: &TaskScheduleConfig,
     today: NaiveDate,
@@ -599,7 +654,7 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use chrono::{NaiveDate, NaiveTime, Weekday};
@@ -607,8 +662,8 @@ mod tests {
     use trading_core::{AppConfig, ScheduleOverduePolicy, ScheduleWeekday, TaskScheduleConfig};
 
     use super::{
-        WatchSource, collect_toml_paths, load_config_dir, resolve_watch_path, schedule_description,
-        schedule_is_due, scheduled_task_counts, scheduled_task_descriptions,
+        WatchSource, collect_toml_paths, load_config_dir, next_watch_wait, resolve_watch_path,
+        schedule_description, schedule_is_due, scheduled_task_counts, scheduled_task_descriptions,
     };
 
     fn weekday_only_schedule() -> TaskScheduleConfig {
@@ -809,6 +864,30 @@ weight = 1.0
     }
 
     #[test]
+    fn next_watch_wait_uses_pending_reload_deadline_when_sooner() {
+        let now = Instant::now();
+        let wait = next_watch_wait(
+            Duration::from_secs(5),
+            Some(now + Duration::from_secs(1)),
+            now,
+        );
+
+        assert_eq!(wait, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn next_watch_wait_caps_elapsed_deadline_to_zero() {
+        let now = Instant::now();
+        let wait = next_watch_wait(
+            Duration::from_secs(5),
+            Some(now - Duration::from_millis(1)),
+            now,
+        );
+
+        assert_eq!(wait, Duration::ZERO);
+    }
+
+    #[test]
     fn load_config_dir_merges_multiple_files() {
         let dir = temp_dir("merge");
         let left = sample_config("task-a", "broker_a", "UTC");
@@ -914,7 +993,7 @@ weight = 1.0
         let descriptions = scheduled_task_descriptions(&config);
         assert_eq!(descriptions.len(), 1);
         assert!(descriptions[0].contains("scheduled-a"));
-        assert!(descriptions[0].contains("overdue_policy=skip"));
+        assert!(descriptions[0].contains("overdue=skip"));
         assert!(!descriptions[0].contains("manual-b"));
         assert!(!descriptions[0].contains("disabled-c"));
     }
