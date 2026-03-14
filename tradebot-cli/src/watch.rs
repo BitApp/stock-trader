@@ -285,19 +285,14 @@ impl WatchState {
 
     fn log_scheduled_tasks(&self, verb: &str) {
         let scheduled_tasks = scheduled_task_descriptions(&self.config);
-        if scheduled_tasks.is_empty() {
-            info!(
-                source = %self.source.display(),
-                timezone = %self.schedule_timezone(),
-                "no scheduled tasks {verb}"
-            );
-            return;
-        }
+        let (enabled_count, total_count) = scheduled_task_counts(&self.config);
 
         info!(
             source = %self.source.display(),
             timezone = %self.schedule_timezone(),
-            count = scheduled_tasks.len(),
+            enabled = enabled_count,
+            total = total_count,
+            summary = %format!("{enabled_count}/{total_count}"),
             "scheduled tasks {verb}"
         );
         for task in scheduled_tasks {
@@ -324,6 +319,20 @@ fn scheduled_task_descriptions(config: &AppConfig) -> Vec<String> {
             ))
         })
         .collect()
+}
+
+fn scheduled_task_counts(config: &AppConfig) -> (usize, usize) {
+    let total = config.tasks.len();
+    let enabled = config
+        .tasks
+        .iter()
+        .filter(|task| {
+            task.schedule
+                .as_ref()
+                .is_some_and(|schedule| schedule.enabled)
+        })
+        .count();
+    (enabled, total)
 }
 
 fn schedule_description(schedule: &TaskScheduleConfig) -> String {
@@ -590,7 +599,7 @@ mod tests {
 
     use super::{
         collect_toml_paths, load_config_dir, schedule_description, schedule_is_due,
-        scheduled_task_descriptions,
+        scheduled_task_counts, scheduled_task_descriptions,
     };
 
     fn weekday_only_schedule() -> TaskScheduleConfig {
@@ -878,6 +887,57 @@ weight = 1.0
         assert!(descriptions[0].contains("overdue_policy=skip"));
         assert!(!descriptions[0].contains("manual-b"));
         assert!(!descriptions[0].contains("disabled-c"));
+    }
+
+    #[test]
+    fn scheduled_task_counts_include_disabled_and_manual_tasks_in_total() {
+        let raw = r#"[defaults]
+timezone = "UTC"
+
+[brokers.paper]
+kind = "ibkr"
+
+[[tasks]]
+name = "scheduled-a"
+broker = "paper"
+schedule = { time = "09:30", weekdays = ["mon"] }
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks.symbols]]
+ticker = "AAPL"
+market = "us"
+weight = 1.0
+
+[[tasks]]
+name = "manual-b"
+broker = "paper"
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks.symbols]]
+ticker = "MSFT"
+market = "us"
+weight = 1.0
+
+[[tasks]]
+name = "disabled-c"
+broker = "paper"
+schedule = { time = "09:30", weekdays = ["mon"], enabled = false }
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks.symbols]]
+ticker = "GOOG"
+market = "us"
+weight = 1.0
+"#;
+        let config = AppConfig::from_toml(raw).unwrap();
+
+        assert_eq!(scheduled_task_counts(&config), (1, 3));
     }
 
     #[test]
