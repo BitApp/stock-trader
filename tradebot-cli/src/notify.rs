@@ -38,13 +38,7 @@ pub fn notify_task_success(config: &AppConfig, task: &TaskConfig, result: &Execu
         let subject = format_subject(config, task, "filled");
         let body = format_filled_body(config, task, result);
         let html_body = format_filled_html(config, task, result);
-        dispatch_notification(
-            task,
-            NotificationEvent::Filled,
-            &subject,
-            &body,
-            &html_body,
-        );
+        dispatch_notification(task, NotificationEvent::Filled, &subject, &body, &html_body);
     } else if task_result_is_partially_filled(result) {
         let subject = format_subject(config, task, "partial_filled");
         let body = format_partial_filled_body(config, task, result);
@@ -283,13 +277,7 @@ fn format_failure_body(config: &AppConfig, task: &TaskConfig, error: &str) -> St
 }
 
 fn format_filled_body(config: &AppConfig, task: &TaskConfig, result: &ExecutionResult) -> String {
-    format_result_text(
-        config,
-        task,
-        result,
-        "filled",
-        "All tracked orders filled.",
-    )
+    format_result_text(config, task, result, "filled", "All tracked orders filled.")
 }
 
 fn format_partial_filled_body(
@@ -330,13 +318,7 @@ fn format_failure_html(config: &AppConfig, task: &TaskConfig, error: &str) -> St
 }
 
 fn format_filled_html(config: &AppConfig, task: &TaskConfig, result: &ExecutionResult) -> String {
-    format_result_html(
-        config,
-        task,
-        result,
-        "filled",
-        "All tracked orders filled.",
-    )
+    format_result_html(config, task, result, "filled", "All tracked orders filled.")
 }
 
 fn format_partial_filled_html(
@@ -493,12 +475,15 @@ fn format_warning_list_html(warnings: &[String]) -> String {
 
     let items = warnings
         .iter()
-        .map(|warning| format!("<li style=\"margin:0 0 8px;\">{}</li>", html_escape(warning)))
+        .map(|warning| {
+            format!(
+                "<li style=\"margin:0 0 8px;\">{}</li>",
+                html_escape(warning)
+            )
+        })
         .collect::<Vec<_>>()
         .join("");
-    format!(
-        "<ul style=\"margin:0;padding-left:20px;\">{items}</ul>"
-    )
+    format!("<ul style=\"margin:0;padding-left:20px;\">{items}</ul>")
 }
 
 fn order_symbol(order: &OrderResult) -> &str {
@@ -791,7 +776,11 @@ mod tests {
         assert!(preview.body.contains("All tracked orders filled."));
         assert!(preview.body.contains("Summary"));
         assert!(preview.body.contains("Orders"));
-        assert!(preview.body.contains("Note\nSend a preview notification with task context."));
+        assert!(
+            preview
+                .body
+                .contains("Note\nSend a preview notification with task context.")
+        );
         assert!(preview.body.contains("\"status\": \"filled\""));
         assert!(preview.html_body.contains("<table"));
         assert!(preview.html_body.contains("All tracked orders filled."));

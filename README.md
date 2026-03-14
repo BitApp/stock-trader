@@ -69,6 +69,41 @@ export IBKR_ALLOW_INSECURE_TLS=true
 export IBKR_AUTO_CONFIRM_REPLIES=true
 ```
 
+If you need multiple accounts for the same broker type in one config, keep credentials in environment variables and add an `env_prefix` per broker instance:
+
+```toml
+[brokers.longbridge_main]
+kind = "longbridge"
+env_prefix = "LONGPORT_MAIN"
+
+[brokers.longbridge_alt]
+kind = "longbridge"
+env_prefix = "LONGPORT_ALT"
+
+[brokers.ibkr_main]
+kind = "ibkr"
+env_prefix = "IBKR_MAIN"
+```
+
+These broker instances will read:
+
+```bash
+export LONGPORT_MAIN_APP_KEY=...
+export LONGPORT_MAIN_APP_SECRET=...
+export LONGPORT_MAIN_ACCESS_TOKEN=...
+
+export LONGPORT_ALT_APP_KEY=...
+export LONGPORT_ALT_APP_SECRET=...
+export LONGPORT_ALT_ACCESS_TOKEN=...
+
+export IBKR_MAIN_BASE_URL=https://127.0.0.1:5000/v1/api
+export IBKR_MAIN_ACCOUNT_ID=DU123456
+export IBKR_MAIN_ALLOW_INSECURE_TLS=true
+export IBKR_MAIN_AUTO_CONFIRM_REPLIES=true
+```
+
+When `env_prefix` is omitted, the runtime keeps using the legacy variable names such as `LONGPORT_APP_KEY` and `IBKR_ACCOUNT_ID`.
+
 Task completion emails can be enabled with a task-level recipient list:
 
 ```toml

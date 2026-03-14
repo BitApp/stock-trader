@@ -49,8 +49,31 @@ pub struct EmailTransportConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BrokerConfig {
     pub kind: String,
+    #[serde(default)]
+    pub env_prefix: Option<String>,
     #[serde(flatten)]
     pub settings: BTreeMap<String, toml::Value>,
+}
+
+impl BrokerConfig {
+    pub fn env_var_name(&self, default_name: &str, suffix: &str) -> String {
+        self.env_prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+            .map(|prefix| format!("{}_{}", prefix.trim_end_matches('_'), suffix))
+            .unwrap_or_else(|| default_name.to_string())
+    }
+
+    fn validate(&self, broker_name: &str) -> Result<()> {
+        if matches!(self.env_prefix.as_deref(), Some(raw) if raw.trim().is_empty()) {
+            return Err(TradeBotError::Config(format!(
+                "broker `{broker_name}` env_prefix cannot be empty"
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -159,6 +182,10 @@ impl AppConfig {
             return Err(TradeBotError::Config(
                 "at least one broker is required".into(),
             ));
+        }
+
+        for (broker_name, broker) in &self.brokers {
+            broker.validate(broker_name)?;
         }
 
         if self.tasks.is_empty() {
@@ -412,11 +439,13 @@ fn align_up_to_step(quantity: u64, quantity_step: u64) -> Result<u64> {
         return Ok(quantity);
     }
 
-    quantity.checked_add(quantity_step - remainder).ok_or_else(|| {
-        TradeBotError::Validation(
-            "quantity constraint overflow while aligning min_quantity to quantity_step".into(),
-        )
-    })
+    quantity
+        .checked_add(quantity_step - remainder)
+        .ok_or_else(|| {
+            TradeBotError::Validation(
+                "quantity constraint overflow while aligning min_quantity to quantity_step".into(),
+            )
+        })
 }
 
 fn validate_execution_policy(
@@ -682,6 +711,7 @@ mod tests {
                 "paper".into(),
                 BrokerConfig {
                     kind: "mock".into(),
+                    env_prefix: None,
                     settings: BTreeMap::new(),
                 },
             )]),
@@ -716,6 +746,21 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(
             matches!(err, TradeBotError::Config(message) if message.contains("invalid defaults.timezone"))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_broker_env_prefix() {
+        let mut config = sample_config(sample_task());
+        config
+            .brokers
+            .get_mut("paper")
+            .expect("paper broker")
+            .env_prefix = Some("   ".into());
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, TradeBotError::Config(message) if message.contains("env_prefix cannot be empty"))
         );
     }
 

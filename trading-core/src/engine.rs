@@ -498,6 +498,7 @@ mod tests {
                 "paper".into(),
                 BrokerConfig {
                     kind: "mock".into(),
+                    env_prefix: None,
                     settings: BTreeMap::new(),
                 },
             )]),
@@ -806,6 +807,7 @@ mod tests {
                 "paper".into(),
                 BrokerConfig {
                     kind: "retry_mock".into(),
+                    env_prefix: None,
                     settings: BTreeMap::new(),
                 },
             )]),
@@ -970,6 +972,7 @@ mod tests {
                 "paper".into(),
                 BrokerConfig {
                     kind: "track_mock".into(),
+                    env_prefix: None,
                     settings: BTreeMap::new(),
                 },
             )]),

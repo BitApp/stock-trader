@@ -430,15 +430,33 @@ fn parse_settings(config: &BrokerConfig) -> Result<IbkrSettings> {
     }
 
     Ok(IbkrSettings {
-        base_url: required_env("IBKR_BASE_URL", "ibkr")?,
-        account_id: required_env("IBKR_ACCOUNT_ID", "ibkr")?,
-        allow_insecure_tls: optional_bool_env("IBKR_ALLOW_INSECURE_TLS", false, "ibkr")?,
-        auto_confirm_replies: optional_bool_env("IBKR_AUTO_CONFIRM_REPLIES", true, "ibkr")?,
+        base_url: required_env(config, "IBKR_BASE_URL", "BASE_URL", "ibkr")?,
+        account_id: required_env(config, "IBKR_ACCOUNT_ID", "ACCOUNT_ID", "ibkr")?,
+        allow_insecure_tls: optional_bool_env(
+            config,
+            "IBKR_ALLOW_INSECURE_TLS",
+            "ALLOW_INSECURE_TLS",
+            false,
+            "ibkr",
+        )?,
+        auto_confirm_replies: optional_bool_env(
+            config,
+            "IBKR_AUTO_CONFIRM_REPLIES",
+            "AUTO_CONFIRM_REPLIES",
+            true,
+            "ibkr",
+        )?,
     })
 }
 
-fn required_env(name: &str, broker: &str) -> Result<String> {
-    match std::env::var(name) {
+fn required_env(
+    config: &BrokerConfig,
+    default_name: &str,
+    suffix: &str,
+    broker: &str,
+) -> Result<String> {
+    let name = config.env_var_name(default_name, suffix);
+    match std::env::var(&name) {
         Ok(value) if !value.trim().is_empty() => Ok(value),
         Ok(_) => Err(TradeBotError::broker(
             broker,
@@ -451,9 +469,16 @@ fn required_env(name: &str, broker: &str) -> Result<String> {
     }
 }
 
-fn optional_bool_env(name: &str, default: bool, broker: &str) -> Result<bool> {
-    match std::env::var(name) {
-        Ok(value) => parse_env_bool(name, &value, broker),
+fn optional_bool_env(
+    config: &BrokerConfig,
+    default_name: &str,
+    suffix: &str,
+    default: bool,
+    broker: &str,
+) -> Result<bool> {
+    let name = config.env_var_name(default_name, suffix);
+    match std::env::var(&name) {
+        Ok(value) => parse_env_bool(&name, &value, broker),
         Err(_) => Ok(default),
     }
 }
@@ -488,6 +513,69 @@ fn ibkr_status_is_final(status: &str) -> bool {
         status.to_ascii_lowercase().as_str(),
         "filled" | "cancelled" | "canceled" | "inactive" | "rejected" | "expired"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use trading_core::BrokerConfig;
+
+    use super::{optional_bool_env, required_env};
+
+    #[test]
+    fn resolves_legacy_ibkr_env_names_without_prefix() {
+        let config = BrokerConfig {
+            kind: "ibkr".into(),
+            env_prefix: None,
+            settings: BTreeMap::new(),
+        };
+
+        let err = required_env(&config, "IBKR_ACCOUNT_ID", "ACCOUNT_ID", "ibkr").unwrap_err();
+        assert!(err.to_string().contains("`IBKR_ACCOUNT_ID`"));
+    }
+
+    #[test]
+    fn resolves_prefixed_ibkr_env_names() {
+        let config = BrokerConfig {
+            kind: "ibkr".into(),
+            env_prefix: Some("IBKR_MAIN".into()),
+            settings: BTreeMap::new(),
+        };
+
+        let err = required_env(&config, "IBKR_ACCOUNT_ID", "ACCOUNT_ID", "ibkr").unwrap_err();
+        assert!(err.to_string().contains("`IBKR_MAIN_ACCOUNT_ID`"));
+    }
+
+    #[test]
+    fn uses_defaults_for_missing_prefixed_optional_bools() {
+        let config = BrokerConfig {
+            kind: "ibkr".into(),
+            env_prefix: Some("IBKR_MAIN".into()),
+            settings: BTreeMap::new(),
+        };
+
+        assert!(
+            !optional_bool_env(
+                &config,
+                "IBKR_ALLOW_INSECURE_TLS",
+                "ALLOW_INSECURE_TLS",
+                false,
+                "ibkr",
+            )
+            .unwrap()
+        );
+        assert!(
+            optional_bool_env(
+                &config,
+                "IBKR_AUTO_CONFIRM_REPLIES",
+                "AUTO_CONFIRM_REPLIES",
+                true,
+                "ibkr",
+            )
+            .unwrap()
+        );
+    }
 }
 
 fn parse_conid_value(conid: Option<&str>) -> Value {

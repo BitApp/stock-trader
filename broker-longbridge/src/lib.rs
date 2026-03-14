@@ -27,7 +27,7 @@ impl BrokerFactory for LongbridgeBrokerFactory {
 
     fn build(&self, broker_name: &str, config: &BrokerConfig) -> Result<Box<dyn Broker>> {
         validate_settings(config)?;
-        let (trade, quote, init_error) = match build_contexts() {
+        let (trade, quote, init_error) = match build_contexts(config) {
             Ok((trade, quote)) => (Some(trade), Some(quote), None),
             Err(err) => (None, None, Some(err.to_string())),
         };
@@ -274,32 +274,33 @@ impl LongbridgeBroker {
     }
 }
 
-fn build_contexts() -> Result<(TradeContextSync, QuoteContextSync)> {
-    let config = Arc::new(build_sdk_config()?);
+fn build_contexts(config: &BrokerConfig) -> Result<(TradeContextSync, QuoteContextSync)> {
+    let config = Arc::new(build_sdk_config(config)?);
     let trade = TradeContextSync::try_new(config.clone(), |_| ()).map_err(map_longbridge_error)?;
     let quote = QuoteContextSync::try_new(config, |_| ()).map_err(map_longbridge_error)?;
     Ok((trade, quote))
 }
 
-fn build_sdk_config() -> Result<LongportConfig> {
-    let app_key = env::var("LONGPORT_APP_KEY").map_err(|_| {
+fn build_sdk_config(config: &BrokerConfig) -> Result<LongportConfig> {
+    let app_key = required_env(config, "LONGPORT_APP_KEY", "APP_KEY").map_err(|name| {
         TradeBotError::broker(
             "longbridge",
-            "missing Longbridge environment variable `LONGPORT_APP_KEY`".to_string(),
+            format!("missing Longbridge environment variable `{name}`"),
         )
     })?;
-    let app_secret = env::var("LONGPORT_APP_SECRET").map_err(|_| {
+    let app_secret = required_env(config, "LONGPORT_APP_SECRET", "APP_SECRET").map_err(|name| {
         TradeBotError::broker(
             "longbridge",
-            "missing Longbridge environment variable `LONGPORT_APP_SECRET`".to_string(),
+            format!("missing Longbridge environment variable `{name}`"),
         )
     })?;
-    let access_token = env::var("LONGPORT_ACCESS_TOKEN").map_err(|_| {
-        TradeBotError::broker(
-            "longbridge",
-            "missing Longbridge environment variable `LONGPORT_ACCESS_TOKEN`".to_string(),
-        )
-    })?;
+    let access_token =
+        required_env(config, "LONGPORT_ACCESS_TOKEN", "ACCESS_TOKEN").map_err(|name| {
+            TradeBotError::broker(
+                "longbridge",
+                format!("missing Longbridge environment variable `{name}`"),
+            )
+        })?;
 
     Ok(LongportConfig::new(app_key, app_secret, access_token).dont_print_quote_packages())
 }
@@ -312,6 +313,15 @@ fn validate_settings(config: &BrokerConfig) -> Result<()> {
     Err(TradeBotError::Config(
         "longbridge broker settings now come from environment variables; remove inline settings from config".into(),
     ))
+}
+
+fn required_env(
+    config: &BrokerConfig,
+    default_name: &str,
+    suffix: &str,
+) -> std::result::Result<String, String> {
+    let name = config.env_var_name(default_name, suffix);
+    env::var(&name).map_err(|_| name)
 }
 
 fn map_longbridge_error(err: impl ToString) -> TradeBotError {
@@ -410,4 +420,37 @@ fn longbridge_order_matches_cancel_filter(
         .map_or(true, |tag| order.remark == *tag || order.msg.contains(tag));
 
     symbol_match && side_match && tag_match
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use trading_core::BrokerConfig;
+
+    use super::required_env;
+
+    #[test]
+    fn resolves_legacy_longbridge_env_names_without_prefix() {
+        let config = BrokerConfig {
+            kind: "longbridge".into(),
+            env_prefix: None,
+            settings: BTreeMap::new(),
+        };
+
+        let err = required_env(&config, "LONGPORT_APP_KEY", "APP_KEY").unwrap_err();
+        assert_eq!(err, "LONGPORT_APP_KEY");
+    }
+
+    #[test]
+    fn resolves_prefixed_longbridge_env_names() {
+        let config = BrokerConfig {
+            kind: "longbridge".into(),
+            env_prefix: Some("LONGPORT_MAIN".into()),
+            settings: BTreeMap::new(),
+        };
+
+        let err = required_env(&config, "LONGPORT_APP_KEY", "APP_KEY").unwrap_err();
+        assert_eq!(err, "LONGPORT_MAIN_APP_KEY");
+    }
 }

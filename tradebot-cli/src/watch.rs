@@ -443,11 +443,14 @@ fn merge_config(
     }
 
     for (name, broker) in config.brokers {
-        if merged.brokers.contains_key(&name) {
-            return Err(TradeBotError::Config(format!(
-                "config dir has duplicate broker `{name}` in `{}`",
-                path.display()
-            )));
+        if let Some(existing) = merged.brokers.get(&name) {
+            if !broker_configs_equal(existing, &broker) {
+                return Err(TradeBotError::Config(format!(
+                    "config dir has conflicting broker `{name}` in `{}`",
+                    path.display()
+                )));
+            }
+            continue;
         }
         merged.brokers.insert(name, broker);
     }
@@ -474,6 +477,15 @@ fn defaults_equal(left: &DefaultsConfig, right: &DefaultsConfig) -> bool {
     left.timezone == right.timezone
         && left.default_tif == right.default_tif
         && email_defaults_equal(left.email.as_ref(), right.email.as_ref())
+}
+
+fn broker_configs_equal(
+    left: &trading_core::BrokerConfig,
+    right: &trading_core::BrokerConfig,
+) -> bool {
+    left.kind == right.kind
+        && left.env_prefix == right.env_prefix
+        && left.settings == right.settings
 }
 
 fn email_defaults_equal(
@@ -777,6 +789,33 @@ weight = 1.0
 
         let err = load_config_dir(&dir).unwrap_err();
         assert!(err.to_string().contains("conflicting defaults"));
+    }
+
+    #[test]
+    fn load_config_dir_allows_duplicate_identical_brokers() {
+        let dir = temp_dir("duplicate-broker");
+        let left = sample_config("task-a", "shared", "UTC");
+        let right = sample_config("task-b", "shared", "UTC");
+        fs::write(dir.join("a.toml"), left).unwrap();
+        fs::write(dir.join("b.toml"), right).unwrap();
+
+        let snapshot = load_config_dir(&dir).unwrap();
+        assert_eq!(snapshot.config.tasks.len(), 2);
+        assert_eq!(snapshot.config.brokers.len(), 1);
+        assert!(snapshot.config.brokers.contains_key("shared"));
+    }
+
+    #[test]
+    fn load_config_dir_rejects_conflicting_duplicate_brokers() {
+        let dir = temp_dir("conflicting-broker");
+        let left = sample_config("task-a", "shared", "UTC");
+        let right = sample_config("task-b", "shared", "UTC")
+            .replace("kind = \"ibkr\"", "kind = \"longbridge\"");
+        fs::write(dir.join("a.toml"), left).unwrap();
+        fs::write(dir.join("b.toml"), right).unwrap();
+
+        let err = load_config_dir(&dir).unwrap_err();
+        assert!(err.to_string().contains("conflicting broker `shared`"));
     }
 
     #[test]

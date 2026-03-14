@@ -218,7 +218,8 @@ fn effective_limit_price(
 fn quantity_rules(symbol: &SymbolTarget) -> Result<QuantityRules> {
     let quantity_step = symbol.quantity_step.unwrap_or(1);
     let min_quantity = symbol.min_quantity.unwrap_or(1);
-    let min_tradable_quantity = round_up_to_step(min_quantity, quantity_step, &symbol.instrument.ticker)?;
+    let min_tradable_quantity =
+        round_up_to_step(min_quantity, quantity_step, &symbol.instrument.ticker)?;
     Ok(QuantityRules {
         min_tradable_quantity,
         quantity_step,
