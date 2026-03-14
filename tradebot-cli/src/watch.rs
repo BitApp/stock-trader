@@ -310,24 +310,60 @@ impl WatchState {
     fn log_scheduled_tasks(&self, verb: &str) {
         let scheduled_tasks = scheduled_task_descriptions(&self.config);
         let (enabled_count, total_count) = scheduled_task_counts(&self.config);
-        let scheduled_count = scheduled_tasks.len();
+        let active_tasks = scheduled_tasks
+            .iter()
+            .filter(|task| task.enabled)
+            .collect::<Vec<_>>();
+        let disabled_tasks = scheduled_tasks
+            .iter()
+            .filter(|task| !task.enabled)
+            .collect::<Vec<_>>();
+        let active_count = active_tasks.len();
+        let disabled_count = disabled_tasks.len();
+        let manual_count = total_count.saturating_sub(scheduled_tasks.len());
 
         info!(
             source = %self.source.display(),
             timezone = %self.schedule_timezone(),
             enabled = enabled_count,
             total = total_count,
-            "scheduled tasks {verb}: {enabled_count}/{total_count} enabled"
+            disabled = disabled_count,
+            manual = manual_count,
+            "scheduled tasks {verb}: {enabled_count}/{total_count} enabled, {} disabled scheduled, {} manual",
+            disabled_count,
+            manual_count
         );
-        for (index, task) in scheduled_tasks.into_iter().enumerate() {
+        if !active_tasks.is_empty() {
             info!(
                 source = %self.source.display(),
-                "{} task {}/{}: {}",
-                task.status_label(),
-                index + 1,
-                scheduled_count,
-                task.description
+                count = active_count,
+                "active scheduled tasks"
             );
+            for (index, task) in active_tasks.into_iter().enumerate() {
+                info!(
+                    source = %self.source.display(),
+                    "ACTIVE {}/{}: {}",
+                    index + 1,
+                    active_count,
+                    task.description
+                );
+            }
+        }
+        if !disabled_tasks.is_empty() {
+            info!(
+                source = %self.source.display(),
+                count = disabled_count,
+                "disabled scheduled tasks"
+            );
+            for (index, task) in disabled_tasks.into_iter().enumerate() {
+                info!(
+                    source = %self.source.display(),
+                    "DISABLED {}/{}: {}",
+                    index + 1,
+                    disabled_count,
+                    task.description
+                );
+            }
         }
     }
 }
@@ -336,16 +372,6 @@ impl WatchState {
 struct ScheduledTaskDescription {
     description: String,
     enabled: bool,
-}
-
-impl ScheduledTaskDescription {
-    fn status_label(&self) -> &'static str {
-        if self.enabled {
-            "active"
-        } else {
-            "disabled"
-        }
-    }
 }
 
 fn scheduled_task_descriptions(config: &AppConfig) -> Vec<ScheduledTaskDescription> {
@@ -364,11 +390,10 @@ fn scheduled_task_descriptions(config: &AppConfig) -> Vec<ScheduledTaskDescripti
 
 fn format_scheduled_task(task: &TaskConfig, schedule: &TaskScheduleConfig) -> String {
     format!(
-        "{} | broker={} | action={} | status={} | {} | overdue={}",
+        "{} | broker={} | action={} | {} | overdue={}",
         task.name,
         task.broker,
         task_action_as_str(task.action),
-        if schedule.enabled { "enabled" } else { "disabled" },
         schedule_when_description(schedule),
         overdue_policy_as_str(schedule.overdue_policy)
     )
@@ -1204,13 +1229,11 @@ weight = 1.0
 
         let descriptions = scheduled_task_descriptions(&config);
         assert_eq!(descriptions.len(), 2);
-        assert_eq!(descriptions[0].status_label(), "active");
+        assert!(descriptions[0].enabled);
         assert!(descriptions[0].description.contains("scheduled-a"));
-        assert!(descriptions[0].description.contains("status=enabled"));
         assert!(descriptions[0].description.contains("overdue=skip"));
-        assert_eq!(descriptions[1].status_label(), "disabled");
+        assert!(!descriptions[1].enabled);
         assert!(descriptions[1].description.contains("disabled-c"));
-        assert!(descriptions[1].description.contains("status=disabled"));
         assert!(!descriptions[1].description.contains("manual-b"));
     }
 
