@@ -381,6 +381,7 @@ fn schedule_when_description(schedule: &TaskScheduleConfig) -> String {
     )
 }
 
+#[cfg(test)]
 fn schedule_description(schedule: &TaskScheduleConfig) -> String {
     let weekday_summary = if schedule.weekdays.is_empty() {
         "all-days".to_string()
