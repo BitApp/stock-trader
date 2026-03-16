@@ -1150,7 +1150,7 @@ fn task_result_is_filled(result: &ExecutionResult) -> bool {
         return false;
     }
 
-    latest_tracked_orders(result)
+    tracked_order_fills(result)
         .into_iter()
         .all(order_is_filled)
 }
@@ -1163,45 +1163,84 @@ fn task_result_is_partially_filled(result: &ExecutionResult) -> bool {
         return false;
     }
 
-    latest_tracked_orders(result)
+    tracked_order_fills(result)
         .into_iter()
         .any(order_has_any_fill)
 }
 
-fn latest_tracked_orders(result: &ExecutionResult) -> Vec<&trading_core::OrderResult> {
-    let mut latest_by_symbol = BTreeMap::new();
-    let mut fallback_orders = Vec::new();
+#[derive(Default)]
+struct TrackedOrderFill {
+    filled_qty: f64,
+    requested_qty: Option<f64>,
+}
+
+fn tracked_order_fills(result: &ExecutionResult) -> Vec<TrackedOrderFill> {
+    let mut fills_by_symbol = BTreeMap::new();
+    let mut fallback_fills = Vec::new();
 
     for order in &result.orders {
-        if let Some(symbol) = order
-            .raw_metadata
-            .get("symbol")
-            .and_then(serde_json::Value::as_str)
-        {
-            latest_by_symbol.insert(symbol.to_string(), order);
+        let fill = TrackedOrderFill {
+            filled_qty: order.filled_qty.unwrap_or(0.0),
+            requested_qty: order_requested_qty(order),
+        };
+
+        if let Some(symbol) = order_symbol_value(order) {
+            let entry = fills_by_symbol
+                .entry(symbol.to_string())
+                .or_insert_with(TrackedOrderFill::default);
+            entry.filled_qty += fill.filled_qty;
+            entry.requested_qty = match (entry.requested_qty, fill.requested_qty) {
+                (Some(current), Some(next)) => Some(current.max(next)),
+                (Some(current), None) => Some(current),
+                (None, Some(next)) => Some(next),
+                (None, None) => None,
+            };
         } else {
-            fallback_orders.push(order);
+            fallback_fills.push(fill);
         }
     }
 
-    if latest_by_symbol.is_empty() {
-        result.orders.iter().collect()
+    if fills_by_symbol.is_empty() {
+        fallback_fills
     } else {
-        latest_by_symbol
+        fills_by_symbol
             .into_values()
-            .chain(fallback_orders)
+            .chain(fallback_fills)
             .collect()
     }
 }
 
-fn order_is_filled(order: &trading_core::OrderResult) -> bool {
-    order.status.eq_ignore_ascii_case("filled")
+fn order_requested_qty(order: &trading_core::OrderResult) -> Option<f64> {
+    order
+        .raw_metadata
+        .get("requested_qty")
+        .or_else(|| order.raw_metadata.get("quantity"))
+        .and_then(value_as_f64)
 }
 
-fn order_has_any_fill(order: &trading_core::OrderResult) -> bool {
-    order.filled_qty.unwrap_or(0.0) > 0.0
-        || order.status.eq_ignore_ascii_case("partially_filled")
-        || order.status.eq_ignore_ascii_case("partial_filled")
+fn order_symbol_value(order: &OrderResult) -> Option<&str> {
+    order.raw_metadata.get("symbol").and_then(serde_json::Value::as_str)
+}
+
+fn value_as_f64(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(raw) => raw.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn order_is_filled(fill: TrackedOrderFill) -> bool {
+    const QTY_EPSILON: f64 = 1e-9;
+
+    fill.requested_qty
+        .filter(|requested_qty| *requested_qty > 0.0)
+        .map(|requested_qty| fill.filled_qty + QTY_EPSILON >= requested_qty)
+        .unwrap_or(false)
+}
+
+fn order_has_any_fill(fill: TrackedOrderFill) -> bool {
+    fill.filled_qty > 0.0
 }
 
 fn timestamp_in_config_timezone(config: &AppConfig) -> String {
@@ -1295,7 +1334,12 @@ mod tests {
         task_result_is_filled, task_result_is_partially_filled,
     };
 
-    fn sample_order(status: &str, symbol: &str, filled_qty: Option<f64>) -> OrderResult {
+    fn sample_order(
+        status: &str,
+        symbol: &str,
+        filled_qty: Option<f64>,
+        requested_qty: Option<f64>,
+    ) -> OrderResult {
         OrderResult {
             broker_order_id: format!("broker-{symbol}-{status}"),
             client_order_id: format!("client-{symbol}-{status}"),
@@ -1303,7 +1347,10 @@ mod tests {
             filled_qty,
             avg_price: None,
             message: None,
-            raw_metadata: json!({ "symbol": symbol }),
+            raw_metadata: json!({
+                "symbol": symbol,
+                "requested_qty": requested_qty,
+            }),
         }
     }
 
@@ -1322,9 +1369,9 @@ mod tests {
     #[test]
     fn filled_notification_requires_latest_order_per_symbol_to_be_filled() {
         let result = sample_result(vec![
-            sample_order("cancelled_for_retry", "SPY", Some(0.0)),
-            sample_order("filled", "SPY", Some(10.0)),
-            sample_order("filled", "QQQ", Some(5.0)),
+            sample_order("cancelled_for_retry", "SPY", Some(0.0), Some(10.0)),
+            sample_order("filled", "SPY", Some(10.0), Some(10.0)),
+            sample_order("filled", "QQQ", Some(5.0), Some(5.0)),
         ]);
 
         assert!(task_result_is_filled(&result));
@@ -1332,7 +1379,7 @@ mod tests {
 
     #[test]
     fn filled_notification_skips_submitted_orders() {
-        let result = sample_result(vec![sample_order("submitted", "SPY", None)]);
+        let result = sample_result(vec![sample_order("submitted", "SPY", None, Some(10.0))]);
 
         assert!(!task_result_is_filled(&result));
     }
@@ -1340,8 +1387,8 @@ mod tests {
     #[test]
     fn partial_filled_notification_requires_fill_but_not_all_filled() {
         let result = sample_result(vec![
-            sample_order("partially_filled", "SPY", Some(3.0)),
-            sample_order("submitted", "QQQ", None),
+            sample_order("partially_filled", "SPY", Some(3.0), Some(10.0)),
+            sample_order("submitted", "QQQ", None, Some(5.0)),
         ]);
 
         assert!(task_result_is_partially_filled(&result));
@@ -1350,9 +1397,33 @@ mod tests {
 
     #[test]
     fn partial_filled_notification_skips_fully_filled_tasks() {
-        let result = sample_result(vec![sample_order("filled", "SPY", Some(10.0))]);
+        let result = sample_result(vec![sample_order("filled", "SPY", Some(10.0), Some(10.0))]);
 
         assert!(!task_result_is_partially_filled(&result));
+    }
+
+    #[test]
+    fn filled_notification_uses_requested_quantity_instead_of_status() {
+        let result = sample_result(vec![sample_order(
+            "FilledStatus",
+            "AAPL.US",
+            Some(1.0),
+            Some(1.0),
+        )]);
+
+        assert!(task_result_is_filled(&result));
+        assert!(!task_result_is_partially_filled(&result));
+    }
+
+    #[test]
+    fn partial_filled_notification_accumulates_fills_across_retries() {
+        let result = sample_result(vec![
+            sample_order("cancelled_for_retry", "SPY", Some(3.0), Some(10.0)),
+            sample_order("tracking_timeout", "SPY", Some(0.0), Some(7.0)),
+        ]);
+
+        assert!(task_result_is_partially_filled(&result));
+        assert!(!task_result_is_filled(&result));
     }
 
     #[test]

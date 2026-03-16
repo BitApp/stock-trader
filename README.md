@@ -152,8 +152,8 @@ cargo run -p tradebot-cli -- preview-notify --config config/example.toml --task 
 Supported notification events are:
 - `success`: task returned successfully
 - `failure`: task returned an error
-- `filled`: all tracked orders in the result ended in `filled`
-- `partial_filled`: at least one tracked order had fill quantity, but not all tracked orders ended in `filled`
+- `filled`: every tracked symbol's cumulative fill quantity reached its requested quantity
+- `partial_filled`: at least one tracked symbol has fill quantity, but not every tracked symbol reached its requested quantity
 
 The watcher can also send email when the effective task list is loaded or changes after a config reload:
 

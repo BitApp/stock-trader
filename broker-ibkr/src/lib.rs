@@ -230,6 +230,23 @@ impl Broker for IbkrBroker {
             .ok_or_else(|| {
                 TradeBotError::broker("ibkr", format!("order `{broker_order_id}` not found"))
             })?;
+        let filled_qty = row
+            .get("filledQuantity")
+            .or_else(|| row.get("filled_qty"))
+            .and_then(|value| parse_ibkr_number(Some(value)));
+        let remaining_qty = row
+            .get("remainingQuantity")
+            .or_else(|| row.get("remaining_qty"))
+            .and_then(|value| parse_ibkr_number(Some(value)));
+        let requested_qty = filled_qty
+            .zip(remaining_qty)
+            .map(|(filled_qty, remaining_qty)| filled_qty + remaining_qty)
+            .or_else(|| {
+                row.get("quantity")
+                    .or_else(|| row.get("totalQuantity"))
+                    .and_then(|value| parse_ibkr_number(Some(value)))
+            });
+        let symbol = row_symbol(&row).map(str::to_string);
 
         Ok(OrderStatusSnapshot {
             broker_order_id: broker_order_id.to_string(),
@@ -239,14 +256,8 @@ impl Broker for IbkrBroker {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
                 .to_string(),
-            filled_qty: row
-                .get("filledQuantity")
-                .or_else(|| row.get("filled_qty"))
-                .and_then(|value| parse_ibkr_number(Some(value))),
-            remaining_qty: row
-                .get("remainingQuantity")
-                .or_else(|| row.get("remaining_qty"))
-                .and_then(|value| parse_ibkr_number(Some(value))),
+            filled_qty,
+            remaining_qty,
             avg_price: row
                 .get("avgPrice")
                 .or_else(|| row.get("avg_price"))
@@ -268,7 +279,7 @@ impl Broker for IbkrBroker {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown"),
             ),
-            raw_metadata: row,
+            raw_metadata: with_standard_order_metadata(row, symbol.as_deref(), requested_qty),
         })
     }
 }
@@ -294,7 +305,11 @@ impl IbkrBroker {
                 filled_qty: None,
                 avg_price: order.limit_price,
                 message: None,
-                raw_metadata: response.clone(),
+                raw_metadata: with_standard_order_metadata(
+                    response.clone(),
+                    Some(order.instrument.broker_symbol.as_str()),
+                    Some(order.quantity as f64),
+                ),
             });
         }
 
@@ -339,7 +354,11 @@ impl IbkrBroker {
                 .and_then(|messages| messages.first())
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
-            raw_metadata: ack,
+            raw_metadata: with_standard_order_metadata(
+                ack,
+                Some(order.instrument.broker_symbol.as_str()),
+                Some(order.quantity as f64),
+            ),
         })
     }
 
@@ -500,6 +519,36 @@ fn parse_ibkr_number(value: Option<&Value>) -> Option<f64> {
         Some(Value::Number(num)) => num.as_f64(),
         _ => None,
     }
+}
+
+fn with_standard_order_metadata(
+    raw: Value,
+    symbol: Option<&str>,
+    requested_qty: Option<f64>,
+) -> Value {
+    let mut object = match raw {
+        Value::Object(object) => object,
+        payload => {
+            let mut object = serde_json::Map::new();
+            object.insert("broker_payload".into(), payload);
+            object
+        }
+    };
+
+    if let Some(symbol) = symbol {
+        object.insert("symbol".into(), Value::String(symbol.to_string()));
+    }
+    if let Some(requested_qty) = requested_qty {
+        object.insert("requested_qty".into(), json!(requested_qty));
+    }
+
+    Value::Object(object)
+}
+
+fn row_symbol(row: &Value) -> Option<&str> {
+    row.get("ticker")
+        .or_else(|| row.get("symbol"))
+        .and_then(Value::as_str)
 }
 
 fn row_order_id(row: &Value) -> Result<String> {

@@ -209,7 +209,10 @@ impl Broker for LongbridgeBroker {
                     filled_qty: None,
                     avg_price: order.limit_price,
                     message: None,
-                    raw_metadata: json!({ "symbol": order.instrument.broker_symbol }),
+                    raw_metadata: json!({
+                        "symbol": order.instrument.broker_symbol,
+                        "requested_qty": order.quantity,
+                    }),
                 })
             })
             .collect()
@@ -363,7 +366,7 @@ fn order_snapshot_from_detail(detail: LongportOrderDetail) -> OrderStatusSnapsho
     let remaining_qty = total_qty
         .zip(filled_qty)
         .map(|(total, filled)| (total - filled).max(0.0));
-    let status = detail.status.to_string();
+    let status = normalize_order_status(detail.status).to_string();
     let is_final = matches!(
         detail.status,
         LongportOrderStatus::Filled
@@ -384,7 +387,34 @@ fn order_snapshot_from_detail(detail: LongportOrderDetail) -> OrderStatusSnapsho
         message: (!detail.msg.is_empty()).then_some(detail.msg),
         is_active: !is_final,
         is_final,
-        raw_metadata: json!({ "symbol": detail.symbol }),
+        raw_metadata: json!({
+            "symbol": detail.symbol,
+            "requested_qty": total_qty,
+        }),
+    }
+}
+
+fn normalize_order_status(status: LongportOrderStatus) -> &'static str {
+    match status {
+        LongportOrderStatus::Unknown => "unknown",
+        LongportOrderStatus::NotReported
+        | LongportOrderStatus::ReplacedNotReported
+        | LongportOrderStatus::ProtectedNotReported
+        | LongportOrderStatus::VarietiesNotReported
+        | LongportOrderStatus::WaitToNew
+        | LongportOrderStatus::New
+        | LongportOrderStatus::WaitToReplace
+        | LongportOrderStatus::PendingReplace
+        | LongportOrderStatus::Replaced => "submitted",
+        LongportOrderStatus::Filled => "filled",
+        LongportOrderStatus::PartialFilled => "partially_filled",
+        LongportOrderStatus::WaitToCancel | LongportOrderStatus::PendingCancel => {
+            "cancel_submitted"
+        }
+        LongportOrderStatus::Rejected => "rejected",
+        LongportOrderStatus::Canceled => "cancelled",
+        LongportOrderStatus::Expired => "expired",
+        LongportOrderStatus::PartialWithdrawal => "partial_withdrawal",
     }
 }
 
@@ -426,9 +456,10 @@ fn longbridge_order_matches_cancel_filter(
 mod tests {
     use std::collections::BTreeMap;
 
+    use longport::trade::OrderStatus as LongportOrderStatus;
     use trading_core::BrokerConfig;
 
-    use super::required_env;
+    use super::{normalize_order_status, required_env};
 
     #[test]
     fn resolves_legacy_longbridge_env_names_without_prefix() {
@@ -452,5 +483,18 @@ mod tests {
 
         let err = required_env(&config, "LONGPORT_APP_KEY", "APP_KEY").unwrap_err();
         assert_eq!(err, "LONGPORT_MAIN_APP_KEY");
+    }
+
+    #[test]
+    fn normalizes_longbridge_order_statuses() {
+        assert_eq!(normalize_order_status(LongportOrderStatus::Filled), "filled");
+        assert_eq!(
+            normalize_order_status(LongportOrderStatus::PartialFilled),
+            "partially_filled"
+        );
+        assert_eq!(
+            normalize_order_status(LongportOrderStatus::PendingCancel),
+            "cancel_submitted"
+        );
     }
 }
