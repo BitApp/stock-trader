@@ -84,16 +84,15 @@ impl Broker for LongbridgeBroker {
     }
 
     fn resolve_instrument(&self, instrument: &InstrumentRef) -> Result<ResolvedInstrument> {
-        let broker_symbol = instrument.broker_symbol.clone().unwrap_or_else(|| {
-            format!(
-                "{}.{}",
-                instrument.ticker,
-                instrument.market.longbridge_suffix()
-            )
-        });
+        let ticker = instrument.ticker.to_ascii_uppercase();
+        let broker_symbol = instrument
+            .broker_symbol
+            .as_ref()
+            .map(|symbol| symbol.to_ascii_uppercase())
+            .unwrap_or_else(|| format!("{}.{}", ticker, instrument.market.longbridge_suffix()));
 
         Ok(ResolvedInstrument {
-            ticker: instrument.ticker.clone(),
+            ticker,
             market: instrument.market,
             broker_symbol,
             conid: instrument.conid.clone(),
@@ -457,9 +456,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use longport::trade::OrderStatus as LongportOrderStatus;
-    use trading_core::BrokerConfig;
+    use trading_core::{Broker, BrokerConfig, InstrumentRef, Market};
 
-    use super::{normalize_order_status, required_env};
+    use super::{LongbridgeBroker, normalize_order_status, required_env};
 
     #[test]
     fn resolves_legacy_longbridge_env_names_without_prefix() {
@@ -496,5 +495,27 @@ mod tests {
             normalize_order_status(LongportOrderStatus::PendingCancel),
             "cancel_submitted"
         );
+    }
+
+    #[test]
+    fn resolves_longbridge_symbols_in_uppercase() {
+        let broker = LongbridgeBroker {
+            name: "longbridge".into(),
+            trade: None,
+            quote: None,
+            init_error: None,
+        };
+
+        let resolved = broker
+            .resolve_instrument(&InstrumentRef {
+                ticker: "aapl".into(),
+                market: Market::Us,
+                broker_symbol: Some("aapl.us".into()),
+                conid: None,
+            })
+            .unwrap();
+
+        assert_eq!(resolved.ticker, "AAPL");
+        assert_eq!(resolved.broker_symbol, "AAPL.US");
     }
 }
