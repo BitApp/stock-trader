@@ -704,6 +704,14 @@ fn format_action(action: TaskAction) -> &'static str {
     }
 }
 
+fn format_task_side(side: Option<trading_core::OrderSide>) -> &'static str {
+    match side {
+        Some(trading_core::OrderSide::Buy) => "buy",
+        Some(trading_core::OrderSide::Sell) => "sell",
+        None => "n/a",
+    }
+}
+
 fn html_escape(raw: impl AsRef<str>) -> String {
     raw.as_ref()
         .replace('&', "&amp;")
@@ -808,11 +816,11 @@ fn format_task_summary_lines(tasks: &[TaskConfig]) -> String {
                 .map(format_task_schedule_summary)
                 .unwrap_or_else(|| "manual".into());
             format!(
-                "- [{}] {} | broker={} | action={} | {}",
+                "- [{}] {} | broker={} | side={} | {}",
                 task_state_label(task_display_state(task)),
                 task.name,
                 task.broker,
-                format_action(task.action),
+                format_task_side(task.side),
                 schedule
             )
         })
@@ -1055,11 +1063,11 @@ fn format_task_summary_line(task: &TaskConfig) -> String {
         .map(format_task_schedule_summary)
         .unwrap_or_else(|| "manual".into());
     format!(
-        "- [{}] {} | broker={} | action={} | {}",
+        "- [{}] {} | broker={} | side={} | {}",
         task_state_label(task_display_state(task)),
         task.name,
         task.broker,
-        format_action(task.action),
+        format_task_side(task.side),
         schedule
     )
 }
@@ -1072,13 +1080,13 @@ fn format_task_summary_card_html(task: &TaskConfig) -> String {
         .map(format_task_schedule_summary)
         .unwrap_or_else(|| "manual".into());
     format!(
-        "<div style=\"margin:0 0 12px;padding:14px 16px;{}\"><div style=\"display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:8px;\"><strong>{}</strong><span style=\"{}\">{}</span></div><div style=\"font-size:13px;color:#2d3a4b;\">broker={} | action={}</div><div style=\"margin-top:6px;font-size:13px;color:#5f6b7a;\">{}</div></div>",
+        "<div style=\"margin:0 0 12px;padding:14px 16px;{}\"><div style=\"display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:8px;\"><strong>{}</strong><span style=\"{}\">{}</span></div><div style=\"font-size:13px;color:#2d3a4b;\">broker={} | side={}</div><div style=\"margin-top:6px;font-size:13px;color:#5f6b7a;\">{}</div></div>",
         task_state_card_style(state),
         html_escape(&task.name),
         task_state_badge_style(state),
         html_escape(task_state_label(state)),
         html_escape(&task.broker),
-        html_escape(format_action(task.action)),
+        html_escape(format_task_side(task.side)),
         html_escape(schedule),
     )
 }
@@ -1574,6 +1582,64 @@ mod tests {
     }
 
     #[test]
+    fn task_list_changed_added_tasks_show_side_instead_of_action() {
+        let current = AppConfig {
+            defaults: DefaultsConfig::default(),
+            watch: sample_watch_config(),
+            brokers: Default::default(),
+            tasks: vec![TaskConfig {
+                name: "added-task".into(),
+                broker: "paper".into(),
+                action: TaskAction::Place,
+                note: None,
+                schedule: Some(trading_core::TaskScheduleConfig {
+                    date: None,
+                    time: "09:30".into(),
+                    weekdays: vec![trading_core::ScheduleWeekday::Mon],
+                    enabled: true,
+                    overdue_policy: trading_core::ScheduleOverduePolicy::Skip,
+                }),
+                execution: None,
+                notify: None,
+                side: Some(trading_core::OrderSide::Buy),
+                pricing: None,
+                risk: None,
+                session: None,
+                shared_budget: None,
+                time_in_force: None,
+                client_tag: None,
+                all_open: false,
+                symbols: vec![],
+            }],
+        };
+        let previous = AppConfig {
+            defaults: DefaultsConfig::default(),
+            watch: sample_watch_config(),
+            brokers: Default::default(),
+            tasks: vec![],
+        };
+
+        let details = task_list_change_details(&previous, &current).unwrap();
+        let body = format_task_list_changed_body(
+            &previous,
+            &current,
+            "config/oneshot-tasks/*.toml",
+            &details,
+        );
+        let html = format_task_list_changed_html(
+            &previous,
+            &current,
+            "config/oneshot-tasks/*.toml",
+            &details,
+        );
+
+        assert!(body.contains("broker=paper | side=buy"));
+        assert!(!body.contains("action=place"));
+        assert!(html.contains("broker=paper | side=buy"));
+        assert!(!html.contains("action=place"));
+    }
+
+    #[test]
     fn task_list_loaded_formats_active_disabled_and_manual_sections() {
         let base_task = TaskConfig {
             name: "base".into(),
@@ -1636,6 +1702,8 @@ mod tests {
         assert!(body.contains("[active] active-task"));
         assert!(body.contains("[disabled] disabled-task"));
         assert!(body.contains("[manual] manual-task"));
+        assert!(body.contains("broker=paper | side=buy"));
+        assert!(!body.contains("action=place"));
 
         assert!(html.contains("Active scheduled tasks"));
         assert!(html.contains("Disabled scheduled tasks"));
@@ -1643,6 +1711,8 @@ mod tests {
         assert!(html.contains(">active<"));
         assert!(html.contains(">disabled<"));
         assert!(html.contains(">manual<"));
+        assert!(html.contains("broker=paper | side=buy"));
+        assert!(!html.contains("action=place"));
     }
 
     #[test]
