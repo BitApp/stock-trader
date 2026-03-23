@@ -390,10 +390,10 @@ fn scheduled_task_descriptions(config: &AppConfig) -> Vec<ScheduledTaskDescripti
 
 fn format_scheduled_task(task: &TaskConfig, schedule: &TaskScheduleConfig) -> String {
     format!(
-        "{} | broker={} | action={} | {} | overdue={}",
+        "{} | broker={} | side={} | {} | overdue={}",
         task.name,
         task.broker,
-        task_action_as_str(task.action),
+        format_task_side(task.side),
         schedule_when_description(schedule),
         overdue_policy_as_str(schedule.overdue_policy)
     )
@@ -466,10 +466,11 @@ fn overdue_policy_as_str(policy: ScheduleOverduePolicy) -> &'static str {
     }
 }
 
-fn task_action_as_str(action: trading_core::TaskAction) -> &'static str {
-    match action {
-        trading_core::TaskAction::Place => "place",
-        trading_core::TaskAction::Cancel => "cancel",
+fn format_task_side(side: Option<trading_core::OrderSide>) -> &'static str {
+    match side {
+        Some(trading_core::OrderSide::Buy) => "buy",
+        Some(trading_core::OrderSide::Sell) => "sell",
+        None => "n/a",
     }
 }
 
@@ -1231,9 +1232,13 @@ weight = 1.0
         assert_eq!(descriptions.len(), 2);
         assert!(descriptions[0].enabled);
         assert!(descriptions[0].description.contains("scheduled-a"));
+        assert!(descriptions[0].description.contains("side=buy"));
         assert!(descriptions[0].description.contains("overdue=skip"));
+        assert!(!descriptions[0].description.contains("action=place"));
         assert!(!descriptions[1].enabled);
         assert!(descriptions[1].description.contains("disabled-c"));
+        assert!(descriptions[1].description.contains("side=buy"));
+        assert!(!descriptions[1].description.contains("action=place"));
         assert!(!descriptions[1].description.contains("manual-b"));
     }
 
