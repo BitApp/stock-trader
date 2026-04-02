@@ -9,9 +9,9 @@ use crate::{
     config::AppConfig,
     errors::Result,
     models::{
-        CancelRequest, CancelResult, ExecutionPolicy, ExecutionResult, OrderResult,
-        OpenOrdersReport, OrderStatusReport, OrderStatusSnapshot, SymbolTarget, TaskAction,
-        TaskAction::Place, ValidationReport,
+        CancelOrderReport, CancelRequest, CancelResult, ExecutionPolicy, ExecutionResult,
+        OpenOrdersReport, OrderResult, OrderStatusReport, OrderStatusSnapshot, SymbolTarget,
+        TaskAction, TaskAction::Place, ValidationReport,
     },
 };
 
@@ -57,7 +57,11 @@ impl TradingEngine {
             TaskAction::Place => {
                 if matches!(
                     task.execution,
-                    Some(ExecutionPolicy::Track { .. } | ExecutionPolicy::CancelReplace { .. })
+                    Some(
+                        ExecutionPolicy::SubmitAck { .. }
+                            | ExecutionPolicy::Track { .. }
+                            | ExecutionPolicy::CancelReplace { .. }
+                    )
                 ) {
                     let execution = task
                         .execution
@@ -146,6 +150,22 @@ impl TradingEngine {
         })
     }
 
+    pub fn cancel_order_by_id(
+        &self,
+        broker_name: &str,
+        broker_order_id: &str,
+    ) -> Result<CancelOrderReport> {
+        let broker_config = self.config.broker(broker_name)?;
+        let broker = self.registry.build(broker_name, broker_config)?;
+        let cancellation = broker.cancel_order_by_id(broker_order_id)?;
+
+        Ok(CancelOrderReport {
+            broker_name: broker_name.to_string(),
+            broker_kind: broker_config.kind.clone(),
+            cancellation,
+        })
+    }
+
     fn run_managed_place_task(
         &self,
         task: &crate::config::TaskConfig,
@@ -175,8 +195,11 @@ impl TradingEngine {
         if placed_orders.iter().any(|order| {
             matches!(
                 execution,
-                ExecutionPolicy::Track { .. } | ExecutionPolicy::CancelReplace { .. }
+                ExecutionPolicy::SubmitAck { .. }
+                    | ExecutionPolicy::Track { .. }
+                    | ExecutionPolicy::CancelReplace { .. }
                     if order.status == "tracking_timeout"
+                        || order.status == "submit_ack_timeout"
                         || order.status == "timeout_unfilled"
                         || order.status == "cancelled_for_retry"
             )
@@ -208,6 +231,10 @@ impl TradingEngine {
     ) -> Result<(Vec<OrderResult>, Vec<CancelResult>)> {
         match execution {
             ExecutionPolicy::OneShot => unreachable!("one_shot does not use managed execution"),
+            ExecutionPolicy::SubmitAck {
+                timeout_seconds,
+                poll_seconds,
+            } => self.submit_ack_single_order(seed_order, broker, *timeout_seconds, *poll_seconds),
             ExecutionPolicy::Track {
                 timeout_seconds,
                 poll_seconds,
@@ -320,6 +347,34 @@ impl TradingEngine {
         Ok((vec![placed], Vec::new()))
     }
 
+    fn submit_ack_single_order(
+        &self,
+        seed_order: &crate::BrokerOrderRequest,
+        broker: &dyn crate::Broker,
+        timeout_seconds: u64,
+        poll_seconds: u64,
+    ) -> Result<(Vec<OrderResult>, Vec<CancelResult>)> {
+        let mut placed = broker
+            .place_orders(std::slice::from_ref(seed_order))?
+            .into_iter()
+            .next()
+            .expect("broker returned empty order list for single order request");
+
+        let snapshot = self.wait_for_submit_ack(
+            broker,
+            &placed.broker_order_id,
+            timeout_seconds,
+            poll_seconds,
+        )?;
+        apply_status_snapshot(&mut placed, &snapshot);
+
+        if !snapshot.is_final && !is_submit_acknowledged(&snapshot) {
+            placed.status = "submit_ack_timeout".into();
+        }
+
+        Ok((vec![placed], Vec::new()))
+    }
+
     fn retry_order_request(
         &self,
         task: &crate::config::TaskConfig,
@@ -355,14 +410,8 @@ impl TradingEngine {
     ) -> Result<OrderStatusSnapshot> {
         let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
         loop {
-            let snapshot = match broker.get_order_status(broker_order_id) {
-                Ok(snapshot) => snapshot,
-                Err(err) if is_transient_missing_order_status(&err) && Instant::now() < deadline => {
-                    thread::sleep(Duration::from_secs(poll_seconds.max(1)));
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
+            let snapshot =
+                self.poll_order_status(broker, broker_order_id, deadline, poll_seconds)?;
             if snapshot.is_final || !snapshot.is_active || timeout_seconds == 0 {
                 return Ok(snapshot);
             }
@@ -370,6 +419,44 @@ impl TradingEngine {
                 return Ok(snapshot);
             }
             thread::sleep(Duration::from_secs(poll_seconds.max(1)));
+        }
+    }
+
+    fn wait_for_submit_ack(
+        &self,
+        broker: &dyn crate::Broker,
+        broker_order_id: &str,
+        timeout_seconds: u64,
+        poll_seconds: u64,
+    ) -> Result<OrderStatusSnapshot> {
+        let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+        loop {
+            let snapshot =
+                self.poll_order_status(broker, broker_order_id, deadline, poll_seconds)?;
+            if snapshot.is_final || is_submit_acknowledged(&snapshot) || timeout_seconds == 0 {
+                return Ok(snapshot);
+            }
+            if Instant::now() >= deadline {
+                return Ok(snapshot);
+            }
+            thread::sleep(Duration::from_secs(poll_seconds.max(1)));
+        }
+    }
+
+    fn poll_order_status(
+        &self,
+        broker: &dyn crate::Broker,
+        broker_order_id: &str,
+        deadline: Instant,
+        poll_seconds: u64,
+    ) -> Result<OrderStatusSnapshot> {
+        match broker.get_order_status(broker_order_id) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(err) if is_transient_missing_order_status(&err) && Instant::now() < deadline => {
+                thread::sleep(Duration::from_secs(poll_seconds.max(1)));
+                self.poll_order_status(broker, broker_order_id, deadline, poll_seconds)
+            }
+            Err(err) => Err(err),
         }
     }
 }
@@ -403,6 +490,14 @@ fn is_transient_missing_order_status(err: &crate::TradeBotError) -> bool {
         err,
         crate::TradeBotError::Broker { message, .. } if message.contains("not found")
     )
+}
+
+fn is_submit_acknowledged(snapshot: &OrderStatusSnapshot) -> bool {
+    snapshot.is_active
+        && !matches!(
+            snapshot.status.to_ascii_lowercase().as_str(),
+            "unknown" | "cancel_submitted"
+        )
 }
 
 #[cfg(test)]
@@ -1031,6 +1126,169 @@ mod tests {
 
         assert_eq!(result.orders.len(), 1);
         assert_eq!(result.orders[0].status, "filled");
+        assert!(result.cancellations.is_empty());
+        assert!(result.warnings.is_empty());
+    }
+
+    struct SubmitAckFactory;
+
+    impl BrokerFactory for SubmitAckFactory {
+        fn kind(&self) -> &'static str {
+            "submit_ack_mock"
+        }
+
+        fn build(&self, broker_name: &str, _config: &BrokerConfig) -> Result<Box<dyn Broker>> {
+            Ok(Box::new(SubmitAckBroker {
+                name: broker_name.to_string(),
+            }))
+        }
+    }
+
+    struct SubmitAckBroker {
+        name: String,
+    }
+
+    impl Broker for SubmitAckBroker {
+        fn broker_name(&self) -> &str {
+            &self.name
+        }
+
+        fn broker_kind(&self) -> &str {
+            "submit_ack_mock"
+        }
+
+        fn health_check(&self) -> Result<BrokerHealth> {
+            Ok(BrokerHealth {
+                reachable: true,
+                authenticated: true,
+                brokerage_session: true,
+                message: None,
+            })
+        }
+
+        fn resolve_instrument(&self, instrument: &InstrumentRef) -> Result<ResolvedInstrument> {
+            Ok(ResolvedInstrument {
+                ticker: instrument.ticker.clone(),
+                market: instrument.market,
+                broker_symbol: format!("{}.US", instrument.ticker),
+                conid: None,
+            })
+        }
+
+        fn fetch_position(&self, instrument: &ResolvedInstrument) -> Result<PositionSnapshot> {
+            Ok(PositionSnapshot {
+                instrument: instrument.clone(),
+                quantity: 100,
+                available_quantity: 100,
+            })
+        }
+
+        fn fetch_quote(&self, _instrument: &ResolvedInstrument) -> Result<Quote> {
+            Ok(Quote {
+                bid: Some(99.0),
+                ask: Some(100.0),
+                last: Some(99.5),
+                currency: Some("USD".into()),
+            })
+        }
+
+        fn place_orders(&self, orders: &[BrokerOrderRequest]) -> Result<Vec<OrderResult>> {
+            Ok(orders
+                .iter()
+                .map(|order| OrderResult {
+                    broker_order_id: format!("ack-{}", order.client_order_id),
+                    client_order_id: order.client_order_id.clone(),
+                    status: "submitted_market".into(),
+                    filled_qty: None,
+                    avg_price: None,
+                    message: None,
+                    raw_metadata: json!({ "symbol": order.instrument.broker_symbol }),
+                })
+                .collect())
+        }
+
+        fn cancel_orders(&self, _request: &CancelRequest) -> Result<Vec<CancelResult>> {
+            Ok(Vec::new())
+        }
+
+        fn get_order_status(&self, broker_order_id: &str) -> Result<OrderStatusSnapshot> {
+            Ok(OrderStatusSnapshot {
+                broker_order_id: broker_order_id.to_string(),
+                status: "PreSubmitted".into(),
+                filled_qty: Some(0.0),
+                remaining_qty: Some(10.0),
+                avg_price: None,
+                message: None,
+                is_active: true,
+                is_final: false,
+                raw_metadata: json!({}),
+            })
+        }
+    }
+
+    #[test]
+    fn run_place_task_submit_ack_returns_after_broker_accepts_order() {
+        let mut registry = BrokerRegistry::new();
+        registry.register(SubmitAckFactory);
+
+        let task = TaskConfig {
+            name: "submit-ack".into(),
+            broker: "paper".into(),
+            action: TaskAction::Place,
+            note: None,
+            schedule: None,
+            execution: Some(ExecutionPolicy::SubmitAck {
+                timeout_seconds: 30,
+                poll_seconds: 1,
+            }),
+            notify: None,
+            side: Some(OrderSide::Buy),
+            pricing: Some(PricingSpec::Market),
+            risk: None,
+            session: None,
+            shared_budget: None,
+            time_in_force: Some(TimeInForce::Day),
+            client_tag: Some("submit-ack-run".into()),
+            all_open: false,
+            symbols: vec![SymbolTarget {
+                instrument: InstrumentRef {
+                    ticker: "AAPL".into(),
+                    market: Market::Us,
+                    broker_symbol: None,
+                    conid: None,
+                },
+                close_position: false,
+                quantity: Some(10),
+                amount: None,
+                weight: None,
+                min_quantity: None,
+                quantity_step: None,
+                limit_price: None,
+                client_order_id: None,
+                broker_options: BTreeMap::new(),
+            }],
+        };
+
+        let config = AppConfig {
+            defaults: DefaultsConfig::default(),
+            watch: WatchConfig::default(),
+            brokers: BTreeMap::from([(
+                "paper".into(),
+                BrokerConfig {
+                    kind: "submit_ack_mock".into(),
+                    env_prefix: None,
+                    settings: BTreeMap::new(),
+                },
+            )]),
+            tasks: vec![task],
+        };
+
+        let result = TradingEngine::new(config, registry)
+            .run_task("submit-ack")
+            .unwrap();
+
+        assert_eq!(result.orders.len(), 1);
+        assert_eq!(result.orders[0].status, "PreSubmitted");
         assert!(result.cancellations.is_empty());
         assert!(result.warnings.is_empty());
     }

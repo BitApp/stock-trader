@@ -696,6 +696,21 @@ fn validate_execution_policy(
 
     match execution {
         ExecutionPolicy::OneShot => {}
+        ExecutionPolicy::SubmitAck {
+            timeout_seconds,
+            poll_seconds,
+        } => {
+            if *timeout_seconds == 0 {
+                return Err(TradeBotError::Validation(format!(
+                    "task `{task_name}` execution.submit_ack.timeout_seconds must be positive"
+                )));
+            }
+            if *poll_seconds == 0 {
+                return Err(TradeBotError::Validation(format!(
+                    "task `{task_name}` execution.poll_seconds must be positive"
+                )));
+            }
+        }
         ExecutionPolicy::Track {
             timeout_seconds,
             poll_seconds,

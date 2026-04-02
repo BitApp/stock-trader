@@ -53,6 +53,16 @@ enum Command {
         #[arg(long)]
         broker: String,
     },
+    CancelOrder {
+        #[arg(long, conflicts_with = "config_dir")]
+        config: Option<PathBuf>,
+        #[arg(long, conflicts_with = "config")]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        broker: String,
+        #[arg(long)]
+        broker_order_id: String,
+    },
     PreviewNotify {
         #[arg(long)]
         config: PathBuf,
@@ -150,6 +160,17 @@ fn run() -> Result<()> {
             let loaded = load_app_config(config, config_dir)?;
             let engine = build_engine(loaded);
             let report = engine.list_open_orders(&broker)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::CancelOrder {
+            config,
+            config_dir,
+            broker,
+            broker_order_id,
+        } => {
+            let loaded = load_app_config(config, config_dir)?;
+            let engine = build_engine(loaded);
+            let report = engine.cancel_order_by_id(&broker, &broker_order_id)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::PreviewNotify {

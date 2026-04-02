@@ -38,6 +38,14 @@ cargo run -p tradebot-cli -- run --config config/example.toml --task ibkr_us_reb
 cargo run -p tradebot-cli -- watch --config config/example.toml
 ```
 
+You can also inspect and manage live broker orders from the CLI:
+
+```bash
+cargo run -p tradebot-cli -- open-orders --config config/open-orders.toml --broker ibkr_alan
+cargo run -p tradebot-cli -- order-status --config config/open-orders.toml --broker ibkr_alan --broker-order-id 3
+cargo run -p tradebot-cli -- cancel-order --config config/open-orders.toml --broker ibkr_alan --broker-order-id 3
+```
+
 Or watch a directory of task files:
 
 ```bash
@@ -193,6 +201,15 @@ If you want the default submit-once behavior but prefer explicit config, use:
 ```toml
 execution = { kind = "one_shot" }
 ```
+
+If you want the task to return as soon as the broker accepts the order into a live working state such as `PreSubmitted` or `Submitted`, use `submit_ack`:
+
+```toml
+pricing = { kind = "market" }
+execution = { kind = "submit_ack", timeout_seconds = 60, poll_seconds = 5 }
+```
+
+`submit_ack` submits once and polls until the broker acknowledges the order as active, or until the timeout elapses. This is the execution mode to use for orders that may sit in `PreSubmitted` for a while, such as IBKR `RTH only` orders entered outside regular hours.
 
 If you want fill tracking without any retry logic, use `track` instead:
 
