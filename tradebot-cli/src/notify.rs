@@ -1501,6 +1501,7 @@ mod tests {
 
     fn sample_watch_config() -> WatchConfig {
         WatchConfig {
+            reload_debounce_seconds: 600,
             notify: Some(WatchNotificationConfig {
                 email: Some(WatchEmailNotificationConfig {
                     to: vec!["ops@example.com".into()],
