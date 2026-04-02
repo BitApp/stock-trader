@@ -10,7 +10,8 @@ use crate::{
     errors::Result,
     models::{
         CancelRequest, CancelResult, ExecutionPolicy, ExecutionResult, OrderResult,
-        OrderStatusSnapshot, SymbolTarget, TaskAction, TaskAction::Place, ValidationReport,
+        OpenOrdersReport, OrderStatusReport, OrderStatusSnapshot, SymbolTarget, TaskAction,
+        TaskAction::Place, ValidationReport,
     },
 };
 
@@ -115,6 +116,34 @@ impl TradingEngine {
                 })
             }
         }
+    }
+
+    pub fn query_order_status(
+        &self,
+        broker_name: &str,
+        broker_order_id: &str,
+    ) -> Result<OrderStatusReport> {
+        let broker_config = self.config.broker(broker_name)?;
+        let broker = self.registry.build(broker_name, broker_config)?;
+        let order = broker.get_order_status(broker_order_id)?;
+
+        Ok(OrderStatusReport {
+            broker_name: broker_name.to_string(),
+            broker_kind: broker_config.kind.clone(),
+            order,
+        })
+    }
+
+    pub fn list_open_orders(&self, broker_name: &str) -> Result<OpenOrdersReport> {
+        let broker_config = self.config.broker(broker_name)?;
+        let broker = self.registry.build(broker_name, broker_config)?;
+        let orders = broker.list_open_orders()?;
+
+        Ok(OpenOrdersReport {
+            broker_name: broker_name.to_string(),
+            broker_kind: broker_config.kind.clone(),
+            orders,
+        })
     }
 
     fn run_managed_place_task(
@@ -326,7 +355,14 @@ impl TradingEngine {
     ) -> Result<OrderStatusSnapshot> {
         let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
         loop {
-            let snapshot = broker.get_order_status(broker_order_id)?;
+            let snapshot = match broker.get_order_status(broker_order_id) {
+                Ok(snapshot) => snapshot,
+                Err(err) if is_transient_missing_order_status(&err) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_secs(poll_seconds.max(1)));
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             if snapshot.is_final || !snapshot.is_active || timeout_seconds == 0 {
                 return Ok(snapshot);
             }
@@ -360,6 +396,13 @@ fn snapshot_filled_qty(snapshot: &OrderStatusSnapshot) -> u64 {
         .filled_qty
         .map(|quantity| quantity.floor() as u64)
         .unwrap_or(0)
+}
+
+fn is_transient_missing_order_status(err: &crate::TradeBotError) -> bool {
+    matches!(
+        err,
+        crate::TradeBotError::Broker { message, .. } if message.contains("not found")
+    )
 }
 
 #[cfg(test)]
@@ -990,6 +1033,190 @@ mod tests {
         assert_eq!(result.orders[0].status, "filled");
         assert!(result.cancellations.is_empty());
         assert!(result.warnings.is_empty());
+    }
+
+    #[derive(Default)]
+    struct DelayedTrackState {
+        status_calls: usize,
+    }
+
+    struct DelayedTrackFactory {
+        state: Arc<Mutex<DelayedTrackState>>,
+    }
+
+    impl BrokerFactory for DelayedTrackFactory {
+        fn kind(&self) -> &'static str {
+            "delayed_track_mock"
+        }
+
+        fn build(&self, broker_name: &str, _config: &BrokerConfig) -> Result<Box<dyn Broker>> {
+            Ok(Box::new(DelayedTrackBroker {
+                name: broker_name.to_string(),
+                state: self.state.clone(),
+            }))
+        }
+    }
+
+    struct DelayedTrackBroker {
+        name: String,
+        state: Arc<Mutex<DelayedTrackState>>,
+    }
+
+    impl Broker for DelayedTrackBroker {
+        fn broker_name(&self) -> &str {
+            &self.name
+        }
+
+        fn broker_kind(&self) -> &str {
+            "delayed_track_mock"
+        }
+
+        fn health_check(&self) -> Result<BrokerHealth> {
+            Ok(BrokerHealth {
+                reachable: true,
+                authenticated: true,
+                brokerage_session: true,
+                message: None,
+            })
+        }
+
+        fn resolve_instrument(&self, instrument: &InstrumentRef) -> Result<ResolvedInstrument> {
+            Ok(ResolvedInstrument {
+                ticker: instrument.ticker.clone(),
+                market: instrument.market,
+                broker_symbol: format!("{}.US", instrument.ticker),
+                conid: None,
+            })
+        }
+
+        fn fetch_position(&self, instrument: &ResolvedInstrument) -> Result<PositionSnapshot> {
+            Ok(PositionSnapshot {
+                instrument: instrument.clone(),
+                quantity: 100,
+                available_quantity: 100,
+            })
+        }
+
+        fn fetch_quote(&self, _instrument: &ResolvedInstrument) -> Result<Quote> {
+            Ok(Quote {
+                bid: Some(99.0),
+                ask: Some(100.0),
+                last: Some(99.5),
+                currency: Some("USD".into()),
+            })
+        }
+
+        fn place_orders(&self, orders: &[BrokerOrderRequest]) -> Result<Vec<OrderResult>> {
+            Ok(orders
+                .iter()
+                .map(|order| OrderResult {
+                    broker_order_id: format!("track-{}", order.client_order_id),
+                    client_order_id: order.client_order_id.clone(),
+                    status: "submitted_market".into(),
+                    filled_qty: None,
+                    avg_price: None,
+                    message: None,
+                    raw_metadata: json!({ "symbol": order.instrument.broker_symbol }),
+                })
+                .collect())
+        }
+
+        fn cancel_orders(&self, _request: &CancelRequest) -> Result<Vec<CancelResult>> {
+            Ok(Vec::new())
+        }
+
+        fn get_order_status(&self, broker_order_id: &str) -> Result<OrderStatusSnapshot> {
+            let mut state = self.state.lock().unwrap();
+            state.status_calls += 1;
+
+            if state.status_calls == 1 {
+                return Err(crate::TradeBotError::broker(
+                    "ibkr",
+                    format!("order `{broker_order_id}` not found"),
+                ));
+            }
+
+            Ok(OrderStatusSnapshot {
+                broker_order_id: broker_order_id.to_string(),
+                status: "submitted".into(),
+                filled_qty: None,
+                remaining_qty: Some(10.0),
+                avg_price: None,
+                message: None,
+                is_active: true,
+                is_final: false,
+                raw_metadata: json!({}),
+            })
+        }
+    }
+
+    #[test]
+    fn run_place_task_retries_transient_missing_order_status() {
+        let state = Arc::new(Mutex::new(DelayedTrackState::default()));
+        let mut registry = BrokerRegistry::new();
+        registry.register(DelayedTrackFactory {
+            state: state.clone(),
+        });
+
+        let task = TaskConfig {
+            name: "track-missing".into(),
+            broker: "paper".into(),
+            action: TaskAction::Place,
+            note: None,
+            schedule: None,
+            execution: Some(ExecutionPolicy::Track {
+                timeout_seconds: 1,
+                poll_seconds: 0,
+            }),
+            notify: None,
+            side: Some(OrderSide::Buy),
+            pricing: Some(PricingSpec::Market),
+            risk: None,
+            session: None,
+            shared_budget: None,
+            time_in_force: Some(TimeInForce::Day),
+            client_tag: Some("track-missing-run".into()),
+            all_open: false,
+            symbols: vec![SymbolTarget {
+                instrument: InstrumentRef {
+                    ticker: "AAPL".into(),
+                    market: Market::Us,
+                    broker_symbol: None,
+                    conid: None,
+                },
+                close_position: false,
+                quantity: Some(10),
+                amount: None,
+                weight: None,
+                min_quantity: None,
+                quantity_step: None,
+                limit_price: None,
+                client_order_id: None,
+                broker_options: BTreeMap::new(),
+            }],
+        };
+
+        let config = AppConfig {
+            defaults: DefaultsConfig::default(),
+            watch: WatchConfig::default(),
+            brokers: BTreeMap::from([(
+                "paper".into(),
+                BrokerConfig {
+                    kind: "delayed_track_mock".into(),
+                    env_prefix: None,
+                    settings: BTreeMap::new(),
+                },
+            )]),
+            tasks: vec![task],
+        };
+
+        let result = TradingEngine::new(config, registry)
+            .run_task("track-missing")
+            .unwrap();
+
+        assert_eq!(result.orders.len(), 1);
+        assert_eq!(result.orders[0].status, "tracking_timeout");
+        assert!(state.lock().unwrap().status_calls >= 2);
     }
 
     #[test]

@@ -448,10 +448,12 @@ fn format_partial_filled_html(
 fn format_task_list_loaded_body(config: &AppConfig, source: &str) -> String {
     let timestamp = timestamp_in_config_timezone(config);
     let counts = task_list_counts(config);
-    let active = format_task_summary_lines(&tasks_with_state(&config.tasks, TaskDisplayState::Active));
+    let active =
+        format_task_summary_lines(&tasks_with_state(&config.tasks, TaskDisplayState::Active));
     let disabled =
         format_task_summary_lines(&tasks_with_state(&config.tasks, TaskDisplayState::Disabled));
-    let manual = format_task_summary_lines(&tasks_with_state(&config.tasks, TaskDisplayState::Manual));
+    let manual =
+        format_task_summary_lines(&tasks_with_state(&config.tasks, TaskDisplayState::Manual));
 
     format!(
         "Task list loaded.\n\nSummary\nTime: {timestamp}\nSource: {source}\nEnabled scheduled tasks: {}/{}\n\nActive scheduled tasks\n{active}\n\nDisabled scheduled tasks\n{disabled}\n\nManual tasks\n{manual}",
@@ -796,7 +798,8 @@ fn task_display_state(task: &TaskConfig) -> TaskDisplayState {
 }
 
 fn tasks_with_state(tasks: &[TaskConfig], state: TaskDisplayState) -> Vec<TaskConfig> {
-    tasks.iter()
+    tasks
+        .iter()
         .filter(|task| task_display_state(task) == state)
         .cloned()
         .collect()
@@ -967,12 +970,7 @@ fn format_field_change_lines(changes: &[TaskFieldChange]) -> String {
 
     changes
         .iter()
-        .map(|change| {
-            format!(
-                "  - {}: {} -> {}",
-                change.path, change.before, change.after
-            )
-        })
+        .map(|change| format!("  - {}: {} -> {}", change.path, change.before, change.after))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1158,9 +1156,7 @@ fn task_result_is_filled(result: &ExecutionResult) -> bool {
         return false;
     }
 
-    tracked_order_fills(result)
-        .into_iter()
-        .all(order_is_filled)
+    tracked_order_fills(result).into_iter().all(order_is_filled)
 }
 
 fn task_result_is_partially_filled(result: &ExecutionResult) -> bool {
@@ -1227,7 +1223,10 @@ fn order_requested_qty(order: &trading_core::OrderResult) -> Option<f64> {
 }
 
 fn order_symbol_value(order: &OrderResult) -> Option<&str> {
-    order.raw_metadata.get("symbol").and_then(serde_json::Value::as_str)
+    order
+        .raw_metadata
+        .get("symbol")
+        .and_then(serde_json::Value::as_str)
 }
 
 fn value_as_f64(value: &serde_json::Value) -> Option<f64> {

@@ -110,10 +110,21 @@ pub struct TaskConfig {
     pub symbols: Vec<SymbolTarget>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WatchConfig {
+    #[serde(default = "default_reload_debounce_seconds")]
+    pub reload_debounce_seconds: u64,
     #[serde(default)]
     pub notify: Option<WatchNotificationConfig>,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            reload_debounce_seconds: default_reload_debounce_seconds(),
+            notify: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -524,6 +535,10 @@ fn default_watch_notification_events() -> Vec<WatchNotificationEvent> {
     ]
 }
 
+fn default_reload_debounce_seconds() -> u64 {
+    600
+}
+
 impl RawTaskConfig {
     fn expand(self, templates: &BTreeMap<String, TaskFieldsConfig>) -> Result<TaskConfig> {
         let mut fields = self
@@ -854,6 +869,12 @@ impl TaskNotificationConfig {
 
 impl WatchConfig {
     fn validate(&self, _defaults: &DefaultsConfig) -> Result<()> {
+        if self.reload_debounce_seconds > 24 * 60 * 60 {
+            return Err(TradeBotError::Config(
+                "watch.reload_debounce_seconds must be at most 86400".into(),
+            ));
+        }
+
         let Some(notify) = &self.notify else {
             return Ok(());
         };
@@ -1163,6 +1184,7 @@ weight = 1.0
     fn accepts_watch_email_notification() {
         let mut config = sample_config(sample_task());
         config.watch = WatchConfig {
+            reload_debounce_seconds: 600,
             notify: Some(WatchNotificationConfig {
                 email: Some(WatchEmailNotificationConfig {
                     to: vec!["ops@example.com".into()],
@@ -1175,6 +1197,25 @@ weight = 1.0
         };
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn watch_config_defaults_reload_debounce_to_ten_minutes() {
+        let config = AppConfig::from_toml(
+            r#"
+[brokers.ibkr]
+kind = "ibkr"
+
+[[tasks]]
+name = "test"
+broker = "ibkr"
+action = "cancel"
+all_open = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.watch.reload_debounce_seconds, 600);
     }
 
     #[test]

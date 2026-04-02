@@ -276,6 +276,21 @@ pub struct ValidationReport {
     pub health: BrokerHealth,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderStatusReport {
+    pub broker_name: String,
+    pub broker_kind: String,
+    pub order: OrderStatusSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenOrdersReport {
+    pub broker_name: String,
+    pub broker_kind: String,
+    #[serde(default)]
+    pub orders: Vec<OrderStatusSnapshot>,
+}
+
 fn default_poll_seconds() -> u64 {
     5
 }

@@ -22,3 +22,4 @@ config
 #.idea/
 .vscode
 .env.local
+.codex-tmp

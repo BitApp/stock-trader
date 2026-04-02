@@ -250,6 +250,24 @@ impl Broker for LongbridgeBroker {
             .map_err(map_longbridge_error)?;
         Ok(order_snapshot_from_detail(detail))
     }
+
+    fn list_open_orders(&self) -> Result<Vec<OrderStatusSnapshot>> {
+        let trade = self.trade_context()?;
+        let mut snapshots = trade
+            .today_orders(None::<GetTodayOrdersOptions>)
+            .map_err(map_longbridge_error)?
+            .into_iter()
+            .filter(|order| !longbridge_order_is_final(order.status))
+            .map(|order| {
+                trade
+                    .order_detail(order.order_id)
+                    .map(order_snapshot_from_detail)
+                    .map_err(map_longbridge_error)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        snapshots.sort_by(|left, right| left.broker_order_id.cmp(&right.broker_order_id));
+        Ok(snapshots)
+    }
 }
 
 impl LongbridgeBroker {
@@ -417,18 +435,22 @@ fn normalize_order_status(status: LongportOrderStatus) -> &'static str {
     }
 }
 
-fn longbridge_order_matches_cancel_filter(
-    order: &longport::trade::Order,
-    request: &CancelRequest,
-) -> bool {
-    if matches!(
-        order.status,
+fn longbridge_order_is_final(status: LongportOrderStatus) -> bool {
+    matches!(
+        status,
         LongportOrderStatus::Filled
             | LongportOrderStatus::Canceled
             | LongportOrderStatus::Expired
             | LongportOrderStatus::Rejected
             | LongportOrderStatus::PartialWithdrawal
-    ) {
+    )
+}
+
+fn longbridge_order_matches_cancel_filter(
+    order: &longport::trade::Order,
+    request: &CancelRequest,
+) -> bool {
+    if longbridge_order_is_final(order.status) {
         return false;
     }
 
@@ -486,7 +508,10 @@ mod tests {
 
     #[test]
     fn normalizes_longbridge_order_statuses() {
-        assert_eq!(normalize_order_status(LongportOrderStatus::Filled), "filled");
+        assert_eq!(
+            normalize_order_status(LongportOrderStatus::Filled),
+            "filled"
+        );
         assert_eq!(
             normalize_order_status(LongportOrderStatus::PartialFilled),
             "partially_filled"

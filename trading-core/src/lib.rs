@@ -17,7 +17,8 @@ pub use engine::TradingEngine;
 pub use errors::{Result, TradeBotError};
 pub use models::{
     BrokerHealth, BrokerOrderRequest, BrokerOrderType, CancelRequest, CancelResult,
-    ExecutionPolicy, ExecutionResult, InstrumentRef, Market, OrderResult, OrderSide,
-    OrderStatusSnapshot, PositionSnapshot, PricingSpec, Quote, ResolvedInstrument, RiskPolicy,
-    SessionPolicy, SharedBudget, SymbolTarget, TaskAction, TimeInForce, ValidationReport,
+    ExecutionPolicy, ExecutionResult, InstrumentRef, Market, OpenOrdersReport, OrderResult,
+    OrderSide, OrderStatusReport, OrderStatusSnapshot, PositionSnapshot, PricingSpec, Quote,
+    ResolvedInstrument, RiskPolicy, SessionPolicy, SharedBudget, SymbolTarget, TaskAction,
+    TimeInForce, ValidationReport,
 };

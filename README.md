@@ -5,14 +5,14 @@ Rust workspace for a unified multi-broker stock trading engine.
 Current scope:
 
 - Unified `trading-core` API for task validation and execution
-- `IBKR` adapter using Client Portal Gateway Web API
+- `IBKR` adapter using the TWS / IB Gateway socket API
 - `Longbridge` adapter scaffold behind the same broker interface
 - Thin CLI for `run`, `validate`, and long-running scheduled `watch`
 
 ## Workspace
 
 - `trading-core`: config parsing, task validation, broker traits, allocation engine
-- `broker-ibkr`: Interactive Brokers Web API adapter
+- `broker-ibkr`: Interactive Brokers TWS / IB Gateway adapter
 - `broker-longbridge`: Longbridge adapter scaffold
 - `tradebot-cli`: command line entry point
 
@@ -56,6 +56,13 @@ schedule = { time = "09:30", weekdays = ["mon", "tue", "wed", "thu", "fri"], ove
 
 `defaults.timezone` determines how scheduled task times are interpreted. `schedule.overdue_policy` defaults to `run`, which backfills a task once the watcher notices the scheduled time has already passed. Set `overdue_policy = "skip"` to suppress those catch-up runs and only fire when the watcher actually crosses the scheduled time while active. Edit the config file while `watch` is running and the process will apply the next valid version without a restart. Config reloads are triggered by file-system events; the watch loop timer is only used to wake up and check whether any scheduled task is now due. With `--config-dir`, the watcher loads every `*.toml` in the directory, merges them, and hot-reloads file additions, removals, and edits. Shared files may contain only common `defaults`, `brokers`, `watch`, or `task_templates` definitions.
 
+The file-reload debounce is configurable under `watch.reload_debounce_seconds` and defaults to 600 seconds:
+
+```toml
+[watch]
+reload_debounce_seconds = 600
+```
+
 Broker connectivity now comes from environment variables rather than inline broker settings:
 
 ```bash
@@ -63,10 +70,10 @@ export LONGPORT_APP_KEY=...
 export LONGPORT_APP_SECRET=...
 export LONGPORT_ACCESS_TOKEN=...
 
-export IBKR_BASE_URL=https://127.0.0.1:5000/v1/api
+export IBKR_HOST=127.0.0.1
+export IBKR_PORT=4001
+export IBKR_CLIENT_ID=100
 export IBKR_ACCOUNT_ID=DU123456
-export IBKR_ALLOW_INSECURE_TLS=true
-export IBKR_AUTO_CONFIRM_REPLIES=true
 ```
 
 If you need multiple accounts for the same broker type in one config, keep credentials in environment variables and add an `env_prefix` per broker instance:
@@ -96,10 +103,10 @@ export LONGPORT_ALT_APP_KEY=...
 export LONGPORT_ALT_APP_SECRET=...
 export LONGPORT_ALT_ACCESS_TOKEN=...
 
-export IBKR_MAIN_BASE_URL=https://127.0.0.1:5000/v1/api
+export IBKR_MAIN_HOST=127.0.0.1
+export IBKR_MAIN_PORT=4001
+export IBKR_MAIN_CLIENT_ID=100
 export IBKR_MAIN_ACCOUNT_ID=DU123456
-export IBKR_MAIN_ALLOW_INSECURE_TLS=true
-export IBKR_MAIN_AUTO_CONFIRM_REPLIES=true
 ```
 
 When `env_prefix` is omitted, the runtime keeps using the legacy variable names such as `LONGPORT_APP_KEY` and `IBKR_ACCOUNT_ID`.
@@ -206,7 +213,7 @@ This sets IBKR `outsideRTH = true` and Longbridge `outside_rth = ANY_TIME`. It i
 
 ## Notes
 
-- `IBKR` requires a running `Client Portal Gateway` session.
+- `IBKR` requires a running `IB Gateway` or `TWS` session with API access enabled.
 - `Longbridge` now supports live position lookup, quote lookup, order submission, order-detail polling, and cancel-by-id for managed execution loops.
-- `IBKR` now supports managed cancel-replace execution via order polling from `iserver/account/orders` and cancel-by-id.
+- `IBKR` now supports managed cancel-replace execution via TWS order polling and cancel-by-id.
 - The public API is centered around `trading_core::TradingEngine`.

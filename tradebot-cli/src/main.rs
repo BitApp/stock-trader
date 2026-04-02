@@ -22,14 +22,36 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Validate {
-        #[arg(long)]
-        config: PathBuf,
+        #[arg(long, conflicts_with = "config_dir")]
+        config: Option<PathBuf>,
+        #[arg(long, conflicts_with = "config")]
+        config_dir: Option<PathBuf>,
     },
     Run {
-        #[arg(long)]
-        config: PathBuf,
+        #[arg(long, conflicts_with = "config_dir")]
+        config: Option<PathBuf>,
+        #[arg(long, conflicts_with = "config")]
+        config_dir: Option<PathBuf>,
         #[arg(long)]
         task: String,
+    },
+    OrderStatus {
+        #[arg(long, conflicts_with = "config_dir")]
+        config: Option<PathBuf>,
+        #[arg(long, conflicts_with = "config")]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        broker: String,
+        #[arg(long)]
+        broker_order_id: String,
+    },
+    OpenOrders {
+        #[arg(long, conflicts_with = "config_dir")]
+        config: Option<PathBuf>,
+        #[arg(long, conflicts_with = "config")]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        broker: String,
     },
     PreviewNotify {
         #[arg(long)]
@@ -82,16 +104,20 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Validate { config } => {
-            let loaded = AppConfig::load(&config)?;
+        Command::Validate { config, config_dir } => {
+            let loaded = load_app_config(config, config_dir)?;
             let engine = build_engine(loaded.clone());
             for task in &loaded.tasks {
                 let report = engine.validate_task(&task.name)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
         }
-        Command::Run { config, task } => {
-            let loaded = AppConfig::load(&config)?;
+        Command::Run {
+            config,
+            config_dir,
+            task,
+        } => {
+            let loaded = load_app_config(config, config_dir)?;
             let task_config = loaded.task(&task)?.clone();
             let engine = build_engine(loaded.clone());
             match engine.run_task(&task) {
@@ -104,6 +130,27 @@ fn run() -> Result<()> {
                     return Err(err);
                 }
             }
+        }
+        Command::OrderStatus {
+            config,
+            config_dir,
+            broker,
+            broker_order_id,
+        } => {
+            let loaded = load_app_config(config, config_dir)?;
+            let engine = build_engine(loaded);
+            let report = engine.query_order_status(&broker, &broker_order_id)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::OpenOrders {
+            config,
+            config_dir,
+            broker,
+        } => {
+            let loaded = load_app_config(config, config_dir)?;
+            let engine = build_engine(loaded);
+            let report = engine.list_open_orders(&broker)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::PreviewNotify {
             config,
@@ -139,6 +186,10 @@ fn run() -> Result<()> {
         } => watch::watch(config, config_dir, poll_seconds)?,
     }
     Ok(())
+}
+
+fn load_app_config(config: Option<PathBuf>, config_dir: Option<PathBuf>) -> Result<AppConfig> {
+    watch::load_app_config(config, config_dir)
 }
 
 fn build_engine(config: AppConfig) -> TradingEngine {

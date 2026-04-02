@@ -33,6 +33,12 @@ pub trait Broker: Send + Sync {
             self.broker_kind()
         )))
     }
+    fn list_open_orders(&self) -> Result<Vec<OrderStatusSnapshot>> {
+        Err(TradeBotError::Unsupported(format!(
+            "broker `{}` does not support list_open_orders",
+            self.broker_kind()
+        )))
+    }
 }
 
 pub trait BrokerFactory: Send + Sync {

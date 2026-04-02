@@ -1,13 +1,27 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
-use reqwest::blocking::{Client, ClientBuilder};
-use serde_json::{Value, json};
+use ibapi::{
+    accounts::PositionUpdate,
+    client::blocking::Client,
+    contracts::Contract,
+    market_data::MarketDataType,
+    market_data::realtime::{TickType, TickTypes},
+    orders::{
+        CancelOrder, ExecutionData, ExecutionFilter, Executions, OrderData,
+        OrderStatus as IbOrderStatus, Orders, PlaceOrder, TimeInForce as IbTimeInForce,
+    },
+    subscriptions::sync::Subscription,
+};
+use serde_json::json;
 use tracing::debug;
 use trading_core::{
     Broker, BrokerConfig, BrokerFactory, BrokerHealth, BrokerOrderRequest, BrokerOrderType,
-    CancelRequest, CancelResult, InstrumentRef, OrderResult, OrderStatusSnapshot, PositionSnapshot,
-    Quote, ResolvedInstrument, Result, TradeBotError,
+    CancelRequest, CancelResult, InstrumentRef, Market, OrderResult, OrderSide,
+    OrderStatusSnapshot, PositionSnapshot, Quote, ResolvedInstrument, Result, TimeInForce,
+    TradeBotError,
 };
+
+const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 pub struct IbkrBrokerFactory;
@@ -19,32 +33,34 @@ impl BrokerFactory for IbkrBrokerFactory {
 
     fn build(&self, broker_name: &str, config: &BrokerConfig) -> Result<Box<dyn Broker>> {
         let settings = parse_settings(config)?;
-        let client = ClientBuilder::new()
-            .danger_accept_invalid_certs(settings.allow_insecure_tls)
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|err| TradeBotError::broker("ibkr", err.to_string()))?;
+        let address = format!("{}:{}", settings.host, settings.port);
+
+        let (client, init_error) = match Client::connect(address.as_str(), settings.client_id) {
+            Ok(client) => (Some(client), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
 
         Ok(Box::new(IbkrBroker {
             name: broker_name.to_string(),
             settings,
             client,
+            init_error,
         }))
     }
 }
 
 struct IbkrSettings {
-    base_url: String,
+    host: String,
+    port: u16,
+    client_id: i32,
     account_id: String,
-    allow_insecure_tls: bool,
-    auto_confirm_replies: bool,
 }
 
 struct IbkrBroker {
     name: String,
     settings: IbkrSettings,
-    client: Client,
+    client: Option<Client>,
+    init_error: Option<String>,
 }
 
 impl Broker for IbkrBroker {
@@ -57,388 +73,383 @@ impl Broker for IbkrBroker {
     }
 
     fn health_check(&self) -> Result<BrokerHealth> {
-        let auth = match self.get_json::<Value>("iserver/auth/status") {
-            Ok(auth) => auth,
-            Err(err) => {
-                return Ok(BrokerHealth {
-                    reachable: false,
-                    authenticated: false,
-                    brokerage_session: false,
-                    message: Some(err.to_string()),
-                });
-            }
+        let Some(client) = &self.client else {
+            return Ok(BrokerHealth {
+                reachable: false,
+                authenticated: false,
+                brokerage_session: false,
+                message: self.init_error.clone(),
+            });
         };
 
-        let brokerage_session = self
-            .get_json::<Value>("iserver/accounts")
-            .map(|accounts| {
-                accounts
-                    .as_array()
-                    .map(|rows| !rows.is_empty())
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
+        match client.managed_accounts() {
+            Ok(accounts) => {
+                let brokerage_session = accounts
+                    .iter()
+                    .any(|account| account == &self.settings.account_id);
+                let message = (!brokerage_session).then(|| {
+                    format!(
+                        "IBKR account `{}` is not exposed by the current Gateway session",
+                        self.settings.account_id
+                    )
+                });
 
-        Ok(BrokerHealth {
-            reachable: true,
-            authenticated: auth
-                .get("authenticated")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            brokerage_session,
-            message: auth
-                .get("message")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-        })
+                Ok(BrokerHealth {
+                    reachable: true,
+                    authenticated: true,
+                    brokerage_session,
+                    message,
+                })
+            }
+            Err(err) => Ok(BrokerHealth {
+                reachable: false,
+                authenticated: false,
+                brokerage_session: false,
+                message: Some(err.to_string()),
+            }),
+        }
     }
 
     fn resolve_instrument(&self, instrument: &InstrumentRef) -> Result<ResolvedInstrument> {
-        let conid = instrument.conid.clone().ok_or_else(|| {
-            TradeBotError::Validation(format!(
-                "IBKR instrument `{}` requires explicit conid in v1",
-                instrument.ticker
-            ))
-        })?;
+        let ticker = instrument.ticker.to_ascii_uppercase();
+        let broker_symbol = instrument
+            .broker_symbol
+            .as_ref()
+            .map(|symbol| symbol.to_ascii_uppercase())
+            .unwrap_or_else(|| ticker.clone());
+
+        if let Some(conid) = instrument.conid.clone() {
+            return Ok(ResolvedInstrument {
+                ticker,
+                market: instrument.market,
+                broker_symbol,
+                conid: Some(conid),
+            });
+        }
+
+        let contract = self.lookup_contract(&ticker, instrument.market)?;
 
         Ok(ResolvedInstrument {
-            ticker: instrument.ticker.clone(),
+            ticker,
             market: instrument.market,
-            broker_symbol: instrument
-                .broker_symbol
-                .clone()
-                .unwrap_or_else(|| instrument.ticker.clone()),
-            conid: Some(conid),
+            broker_symbol: contract_display_symbol(&contract),
+            conid: Some(contract.contract_id.to_string()),
         })
+    }
+
+    fn fetch_position(&self, instrument: &ResolvedInstrument) -> Result<PositionSnapshot> {
+        let client = self.client()?;
+        let positions = client.positions().map_err(map_ibkr_error)?;
+
+        while let Some(update) = positions.next_timeout(SUBSCRIPTION_TIMEOUT) {
+            match update {
+                PositionUpdate::Position(position) => {
+                    if position.account != self.settings.account_id {
+                        continue;
+                    }
+                    if !contract_matches(&position.contract, instrument) {
+                        continue;
+                    }
+
+                    let quantity = normalize_position_qty(position.position)?;
+                    if quantity == 0 {
+                        return Err(TradeBotError::Validation(format!(
+                            "IBKR position not found for `{}`",
+                            instrument.broker_symbol
+                        )));
+                    }
+
+                    return Ok(PositionSnapshot {
+                        instrument: instrument.clone(),
+                        quantity,
+                        available_quantity: quantity,
+                    });
+                }
+                PositionUpdate::PositionEnd => break,
+            }
+        }
+        if let Some(err) = positions.error() {
+            return Err(map_ibkr_error(err));
+        }
+
+        Err(TradeBotError::Validation(format!(
+            "IBKR position not found for `{}`",
+            instrument.broker_symbol
+        )))
     }
 
     fn fetch_quote(&self, instrument: &ResolvedInstrument) -> Result<Quote> {
-        let conid = instrument
-            .conid
-            .as_ref()
-            .ok_or_else(|| TradeBotError::Validation("IBKR quote lookup requires conid".into()))?;
-        let snapshot_path =
-            format!("iserver/marketdata/snapshot?conids={conid}&fields=31,84,85,86,88");
+        let client = self.client()?;
+        let contract = contract_from_resolved(instrument)?;
+        let realtime = snapshot_quote(client, &contract, instrument.market)?;
+        if has_quote_value(&realtime) {
+            return Ok(realtime);
+        }
 
-        let _preflight: Value = self.get_json(&snapshot_path)?;
-        let payload: Value = self.get_json(&snapshot_path)?;
-        let first = payload
-            .as_array()
-            .and_then(|rows| rows.first())
-            .ok_or_else(|| TradeBotError::broker("ibkr", "empty snapshot response"))?;
+        client
+            .switch_market_data_type(MarketDataType::Delayed)
+            .map_err(map_ibkr_error)?;
+        let delayed = snapshot_quote(client, &contract, instrument.market)?;
+        if has_quote_value(&delayed) {
+            return Ok(delayed);
+        }
 
-        Ok(Quote {
-            bid: parse_ibkr_number(first.get("84")),
-            ask: parse_ibkr_number(first.get("86")),
-            last: parse_ibkr_number(first.get("31")),
-            currency: None,
-        })
-    }
-
-    fn fetch_position(&self, _instrument: &ResolvedInstrument) -> Result<PositionSnapshot> {
-        Err(TradeBotError::Unsupported(
-            "IBKR position-backed close_position tasks are not wired yet".into(),
+        Err(TradeBotError::broker(
+            "ibkr",
+            format!("missing quote for `{}`", instrument.broker_symbol),
         ))
     }
 
     fn place_orders(&self, orders: &[BrokerOrderRequest]) -> Result<Vec<OrderResult>> {
-        let payload = orders
-            .iter()
-            .map(|order| {
-                let mut body = json!({
-                    "conid": parse_conid_value(order.instrument.conid.as_deref()),
-                    "side": order.side.as_uppercase(),
-                    "orderType": match order.order_type {
-                        BrokerOrderType::Market => "MKT",
-                        BrokerOrderType::Limit => "LMT",
-                    },
-                    "quantity": order.quantity,
-                    "tif": order.tif.as_ibkr(),
-                    "order_ref": order.client_order_id,
-                });
-                if let Some(limit_price) = order.limit_price {
-                    body["price"] = json!(limit_price);
-                }
-                if order.extended_hours {
-                    body["outsideRTH"] = json!(true);
-                }
-                if order.allow_margin {
-                    body["isClose"] = json!(false);
-                }
-                body
-            })
-            .collect::<Vec<_>>();
-
-        let response = self.post_json(
-            &format!("iserver/account/{}/orders", self.settings.account_id),
-            &Value::Array(payload),
-        )?;
+        let client = self.client()?;
 
         orders
             .iter()
-            .map(|order| self.parse_place_response(&response, order))
+            .map(|order| {
+                let contract = contract_from_resolved(&order.instrument)?;
+                let ib_order = build_ib_order(client, &self.settings, order)?;
+                let order_id = client.next_order_id();
+                let mut updates = client
+                    .place_order(order_id, &contract, &ib_order)
+                    .map_err(map_ibkr_error)?;
+                let snapshot = collect_place_order_snapshot(order_id, &mut updates)?;
+
+                Ok(order_result_from_place_snapshot(order_id, order, &snapshot))
+            })
             .collect()
     }
 
     fn cancel_orders(&self, request: &CancelRequest) -> Result<Vec<CancelResult>> {
-        let rows = self.live_orders()?;
-
+        let mut live_orders = self.read_orders(|client| client.all_open_orders())?;
         let mut results = Vec::new();
 
-        for row in rows {
+        for (order_id, row) in live_orders.drain() {
             if !matches_cancel_filter(&row, request) {
                 continue;
             }
-            let order_id = row_order_id(&row)?;
-            results.push(self.cancel_order_by_id(&order_id)?);
+            results.push(self.cancel_order_by_id(&order_id.to_string())?);
         }
 
         Ok(results)
     }
 
     fn cancel_order_by_id(&self, broker_order_id: &str) -> Result<CancelResult> {
-        let response = self.delete_json(&format!(
-            "iserver/account/{}/order/{}",
-            self.settings.account_id, broker_order_id
-        ))?;
+        let client = self.client()?;
+        let order_id = parse_order_id(broker_order_id)?;
+        let updates = client.cancel_order(order_id, "").map_err(map_ibkr_error)?;
+
+        let mut status = None;
+        let mut message = None;
+        while let Some(update) = updates.next_timeout(SUBSCRIPTION_TIMEOUT) {
+            match update {
+                CancelOrder::OrderStatus(order_status) => {
+                    status = Some(order_status.status.clone());
+                }
+                CancelOrder::Notice(notice) => {
+                    message = Some(notice.message.clone());
+                }
+            }
+        }
+        if let Some(err) = updates.error() {
+            return Err(map_ibkr_error(err));
+        }
 
         Ok(CancelResult {
             broker_order_id: broker_order_id.to_string(),
-            status: response
-                .get("msg")
-                .and_then(Value::as_str)
-                .unwrap_or("cancel_submitted")
-                .to_string(),
-            message: response
-                .get("msg")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            raw_metadata: response,
+            status: status.unwrap_or_else(|| "cancel_submitted".into()),
+            message,
+            raw_metadata: json!({ "order_id": order_id }),
         })
     }
 
     fn get_order_status(&self, broker_order_id: &str) -> Result<OrderStatusSnapshot> {
-        let row = self
-            .live_orders()?
-            .into_iter()
-            .find(|row| {
-                row.get("orderId")
-                    .and_then(value_to_string)
-                    .map(|id| id == broker_order_id)
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| {
-                TradeBotError::broker("ibkr", format!("order `{broker_order_id}` not found"))
-            })?;
-        let filled_qty = row
-            .get("filledQuantity")
-            .or_else(|| row.get("filled_qty"))
-            .and_then(|value| parse_ibkr_number(Some(value)));
-        let remaining_qty = row
-            .get("remainingQuantity")
-            .or_else(|| row.get("remaining_qty"))
-            .and_then(|value| parse_ibkr_number(Some(value)));
-        let requested_qty = filled_qty
-            .zip(remaining_qty)
-            .map(|(filled_qty, remaining_qty)| filled_qty + remaining_qty)
-            .or_else(|| {
-                row.get("quantity")
-                    .or_else(|| row.get("totalQuantity"))
-                    .and_then(|value| parse_ibkr_number(Some(value)))
-            });
-        let symbol = row_symbol(&row).map(str::to_string);
+        let order_id = parse_order_id(broker_order_id)?;
 
-        Ok(OrderStatusSnapshot {
-            broker_order_id: broker_order_id.to_string(),
-            status: row
-                .get("status")
-                .or_else(|| row.get("order_status"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
-            filled_qty,
-            remaining_qty,
-            avg_price: row
-                .get("avgPrice")
-                .or_else(|| row.get("avg_price"))
-                .and_then(|value| parse_ibkr_number(Some(value))),
-            message: row
-                .get("statusDescription")
-                .or_else(|| row.get("message"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            is_active: !ibkr_status_is_final(
-                row.get("status")
-                    .or_else(|| row.get("order_status"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown"),
-            ),
-            is_final: ibkr_status_is_final(
-                row.get("status")
-                    .or_else(|| row.get("order_status"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown"),
-            ),
-            raw_metadata: with_standard_order_metadata(row, symbol.as_deref(), requested_qty),
-        })
+        if let Some(snapshot) = self.query_live_order_status(order_id)? {
+            return Ok(snapshot);
+        }
+        if let Some(snapshot) = self.query_completed_order_status(order_id)? {
+            return Ok(snapshot);
+        }
+        if let Some(snapshot) = self.query_execution_status(order_id)? {
+            return Ok(snapshot);
+        }
+
+        Err(TradeBotError::broker(
+            "ibkr",
+            format!("order `{broker_order_id}` not found"),
+        ))
+    }
+
+    fn list_open_orders(&self) -> Result<Vec<OrderStatusSnapshot>> {
+        let mut orders = self.read_live_orders()?;
+        let mut snapshots = orders
+            .drain()
+            .filter_map(|(order_id, row)| {
+                let snapshot = order_status_snapshot_from_order_row(order_id, row);
+                snapshot.is_active.then_some(snapshot)
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| snapshot.broker_order_id.parse::<i32>().unwrap_or(i32::MAX));
+        Ok(snapshots)
     }
 }
 
 impl IbkrBroker {
-    fn parse_place_response(
-        &self,
-        response: &Value,
-        order: &BrokerOrderRequest,
-    ) -> Result<OrderResult> {
-        if response.is_object() {
-            return Ok(OrderResult {
-                broker_order_id: response
-                    .get("order_id")
-                    .and_then(value_to_string)
-                    .unwrap_or_else(|| "unknown".into()),
-                client_order_id: order.client_order_id.clone(),
-                status: response
-                    .get("order_status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("submitted")
-                    .to_string(),
-                filled_qty: None,
-                avg_price: order.limit_price,
-                message: None,
-                raw_metadata: with_standard_order_metadata(
-                    response.clone(),
-                    Some(order.instrument.broker_symbol.as_str()),
-                    Some(order.quantity as f64),
-                ),
-            });
-        }
-
-        let first_reply = response
-            .as_array()
-            .and_then(|rows| rows.first())
-            .ok_or_else(|| TradeBotError::broker("ibkr", "invalid order response"))?;
-
-        let reply_id = first_reply
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| TradeBotError::broker("ibkr", "missing IBKR reply id"))?;
-
-        let ack = if self.settings.auto_confirm_replies {
-            self.post_json(
-                &format!("iserver/reply/{reply_id}"),
-                &json!({ "confirmed": true }),
-            )?
-        } else {
-            return Err(TradeBotError::broker(
+    fn client(&self) -> Result<&Client> {
+        self.client.as_ref().ok_or_else(|| {
+            TradeBotError::broker(
                 "ibkr",
-                format!("order reply requires confirmation: {}", first_reply),
-            ));
-        };
-
-        Ok(OrderResult {
-            broker_order_id: ack
-                .get("order_id")
-                .and_then(value_to_string)
-                .unwrap_or_else(|| "unknown".into()),
-            client_order_id: order.client_order_id.clone(),
-            status: ack
-                .get("order_status")
-                .and_then(Value::as_str)
-                .unwrap_or("submitted")
-                .to_string(),
-            filled_qty: None,
-            avg_price: order.limit_price,
-            message: first_reply
-                .get("message")
-                .and_then(Value::as_array)
-                .and_then(|messages| messages.first())
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            raw_metadata: with_standard_order_metadata(
-                ack,
-                Some(order.instrument.broker_symbol.as_str()),
-                Some(order.quantity as f64),
-            ),
+                self.init_error
+                    .clone()
+                    .unwrap_or_else(|| "IBKR client is not connected".into()),
+            )
         })
     }
 
-    fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let url = self.url(path);
-        debug!("ibkr GET {}", url);
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .map_err(|err| TradeBotError::broker("ibkr", err.to_string()))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(TradeBotError::broker(
-                "ibkr",
-                format!("GET {path} failed with status {status}"),
-            ));
+    fn lookup_contract(&self, symbol: &str, market: Market) -> Result<Contract> {
+        let client = self.client()?;
+        let template = contract_template(symbol, market);
+        let details = client.contract_details(&template).map_err(map_ibkr_error)?;
+
+        for detail in details {
+            if detail.contract.contract_id > 0 {
+                return Ok(detail.contract);
+            }
         }
-        response
-            .json::<T>()
-            .map_err(|err| TradeBotError::broker("ibkr", err.to_string()))
+
+        Err(TradeBotError::Validation(format!(
+            "IBKR contract lookup failed for `{symbol}`"
+        )))
     }
 
-    fn post_json(&self, path: &str, body: &Value) -> Result<Value> {
-        let url = self.url(path);
-        debug!("ibkr POST {}", url);
-        let response = self
-            .client
-            .post(url)
-            .json(body)
-            .send()
-            .map_err(|err| TradeBotError::broker("ibkr", err.to_string()))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(TradeBotError::broker(
-                "ibkr",
-                format!("POST {path} failed with status {status}"),
-            ));
+    fn read_orders(
+        &self,
+        fetch: impl FnOnce(&Client) -> std::result::Result<Subscription<Orders>, ibapi::Error>,
+    ) -> Result<HashMap<i32, OrderSnapshotData>> {
+        let client = self.client()?;
+        let stream = fetch(client).map_err(map_ibkr_error)?;
+        let mut rows: HashMap<i32, OrderSnapshotData> = HashMap::new();
+        let mut last_notice = None;
+
+        while let Some(update) = stream.next_timeout(SUBSCRIPTION_TIMEOUT) {
+            match update {
+                Orders::OrderData(data) => {
+                    let order_id = data.order_id;
+                    rows.entry(order_id).or_default().data = Some(data);
+                }
+                Orders::OrderStatus(status) => {
+                    let order_id = status.order_id;
+                    rows.entry(order_id).or_default().status = Some(status);
+                }
+                Orders::Notice(notice) => {
+                    last_notice = Some(notice.message);
+                }
+            }
         }
-        response
-            .json::<Value>()
-            .map_err(|err| TradeBotError::broker("ibkr", err.to_string()))
-    }
-
-    fn delete_json(&self, path: &str) -> Result<Value> {
-        let url = self.url(path);
-        debug!("ibkr DELETE {}", url);
-        let response = self
-            .client
-            .delete(url)
-            .send()
-            .map_err(|err| TradeBotError::broker("ibkr", err.to_string()))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(TradeBotError::broker(
-                "ibkr",
-                format!("DELETE {path} failed with status {status}"),
-            ));
+        if let Some(err) = stream.error() {
+            return Err(map_ibkr_error(err));
         }
-        response
-            .json::<Value>()
-            .map_err(|err| TradeBotError::broker("ibkr", err.to_string()))
+        if let Some(notice) = last_notice {
+            for row in rows.values_mut() {
+                if row.notice.is_none() {
+                    row.notice = Some(notice.clone());
+                }
+            }
+        }
+
+        Ok(rows)
     }
 
-    fn url(&self, path: &str) -> String {
-        let base = self.settings.base_url.trim_end_matches('/');
-        format!("{base}/{path}")
+    fn read_live_orders(&self) -> Result<HashMap<i32, OrderSnapshotData>> {
+        let mut rows = self.read_orders(|client| client.open_orders())?;
+        for (order_id, row) in self.read_orders(|client| client.all_open_orders())? {
+            rows.entry(order_id)
+                .and_modify(|existing| merge_order_snapshot_row(existing, &row))
+                .or_insert(row);
+        }
+        rows.retain(|_, row| order_row_matches_account(row, &self.settings.account_id));
+        Ok(rows)
     }
 
-    fn live_orders(&self) -> Result<Vec<Value>> {
-        let live_orders = self.get_json::<Value>(&format!(
-            "iserver/account/orders?force=true&accountId={}",
-            self.settings.account_id
-        ))?;
-        live_orders
-            .get("orders")
-            .and_then(Value::as_array)
+    fn query_live_order_status(&self, order_id: i32) -> Result<Option<OrderStatusSnapshot>> {
+        let orders = self.read_live_orders()?;
+        Ok(orders
+            .get(&order_id)
             .cloned()
-            .ok_or_else(|| TradeBotError::broker("ibkr", "invalid live orders response"))
+            .map(|row| order_status_snapshot_from_order_row(order_id, row)))
     }
+
+    fn query_completed_order_status(&self, order_id: i32) -> Result<Option<OrderStatusSnapshot>> {
+        let orders = self.read_orders(|client| client.completed_orders(false))?;
+        Ok(orders
+            .get(&order_id)
+            .cloned()
+            .map(|row| order_status_snapshot_from_order_row(order_id, row)))
+    }
+
+    fn query_execution_status(&self, order_id: i32) -> Result<Option<OrderStatusSnapshot>> {
+        let client = self.client()?;
+        let filter = ExecutionFilter {
+            client_id: Some(self.settings.client_id),
+            account_code: self.settings.account_id.clone(),
+            time: String::new(),
+            symbol: String::new(),
+            security_type: String::new(),
+            exchange: String::new(),
+            side: String::new(),
+            last_n_days: 7,
+            specific_dates: Vec::new(),
+        };
+        let executions = client.executions(filter).map_err(map_ibkr_error)?;
+        let mut latest = None;
+
+        while let Some(update) = executions.next_timeout(SUBSCRIPTION_TIMEOUT) {
+            match update {
+                Executions::ExecutionData(update) if update.execution.order_id == order_id => {
+                    latest = Some(update);
+                }
+                Executions::ExecutionData(_)
+                | Executions::CommissionReport(_)
+                | Executions::Notice(_) => {}
+            }
+        }
+        if let Some(err) = executions.error() {
+            return Err(map_ibkr_error(err));
+        }
+
+        Ok(latest.map(|execution| OrderStatusSnapshot {
+            broker_order_id: order_id.to_string(),
+            status: "Filled".into(),
+            filled_qty: positive_or_none(execution.execution.cumulative_quantity),
+            remaining_qty: Some(0.0),
+            avg_price: positive_or_none(execution.execution.average_price),
+            message: None,
+            is_active: false,
+            is_final: true,
+            raw_metadata: json!({
+                "symbol": contract_display_symbol(&execution.contract),
+                "broker_order_id": order_id,
+                "account": execution.execution.account_number,
+                "order_reference": execution.execution.order_reference,
+            }),
+        }))
+    }
+}
+
+#[derive(Default, Clone)]
+struct OrderSnapshotData {
+    data: Option<OrderData>,
+    status: Option<IbOrderStatus>,
+    notice: Option<String>,
+}
+
+#[derive(Default)]
+struct PlaceOrderSnapshot {
+    data: Option<OrderData>,
+    status: Option<IbOrderStatus>,
+    execution: Option<ExecutionData>,
+    message: Option<String>,
 }
 
 fn parse_settings(config: &BrokerConfig) -> Result<IbkrSettings> {
@@ -449,23 +460,382 @@ fn parse_settings(config: &BrokerConfig) -> Result<IbkrSettings> {
     }
 
     Ok(IbkrSettings {
-        base_url: required_env(config, "IBKR_BASE_URL", "BASE_URL", "ibkr")?,
+        host: optional_env(config, "IBKR_HOST", "HOST").unwrap_or_else(|| "127.0.0.1".into()),
+        port: optional_u16_env(config, "IBKR_PORT", "PORT", 4001, "ibkr")?,
+        client_id: optional_i32_env(config, "IBKR_CLIENT_ID", "CLIENT_ID", 100, "ibkr")?,
         account_id: required_env(config, "IBKR_ACCOUNT_ID", "ACCOUNT_ID", "ibkr")?,
-        allow_insecure_tls: optional_bool_env(
-            config,
-            "IBKR_ALLOW_INSECURE_TLS",
-            "ALLOW_INSECURE_TLS",
-            false,
-            "ibkr",
-        )?,
-        auto_confirm_replies: optional_bool_env(
-            config,
-            "IBKR_AUTO_CONFIRM_REPLIES",
-            "AUTO_CONFIRM_REPLIES",
-            true,
-            "ibkr",
-        )?,
     })
+}
+
+fn build_ib_order(
+    client: &Client,
+    settings: &IbkrSettings,
+    order: &BrokerOrderRequest,
+) -> Result<ibapi::orders::Order> {
+    let contract = contract_from_resolved(&order.instrument)?;
+    let mut builder = client.order(&contract);
+
+    builder = match order.side {
+        OrderSide::Buy => builder.buy(order.quantity as f64),
+        OrderSide::Sell => builder.sell(order.quantity as f64),
+    };
+
+    if order.extended_hours {
+        builder = builder.outside_rth();
+    }
+
+    let mut ib_order = match order.order_type {
+        BrokerOrderType::Market => builder.market().build_order().map_err(map_ibkr_error)?,
+        BrokerOrderType::Limit => builder
+            .limit(order.limit_price.ok_or_else(|| {
+                TradeBotError::Validation(format!(
+                    "IBKR limit order for `{}` is missing limit_price",
+                    order.instrument.broker_symbol
+                ))
+            })?)
+            .build_order()
+            .map_err(map_ibkr_error)?,
+    };
+
+    ib_order.account = settings.account_id.clone();
+    ib_order.tif = map_time_in_force(order.tif);
+    ib_order.order_ref = order
+        .client_tag
+        .clone()
+        .unwrap_or_else(|| order.client_order_id.clone());
+    ib_order.outside_rth = order.extended_hours;
+
+    Ok(ib_order)
+}
+
+fn collect_place_order_snapshot(
+    order_id: i32,
+    stream: &mut Subscription<PlaceOrder>,
+) -> Result<PlaceOrderSnapshot> {
+    let mut snapshot = PlaceOrderSnapshot::default();
+
+    while let Some(update) = stream.next_timeout(SUBSCRIPTION_TIMEOUT) {
+        match update {
+            PlaceOrder::OpenOrder(data) => snapshot.data = Some(data),
+            PlaceOrder::OrderStatus(status) => snapshot.status = Some(status),
+            PlaceOrder::ExecutionData(execution) => snapshot.execution = Some(execution),
+            PlaceOrder::Message(notice) => snapshot.message = Some(notice.message),
+            PlaceOrder::CommissionReport(_) => {}
+        }
+
+        if snapshot
+            .status
+            .as_ref()
+            .map(|status| ibkr_status_is_final(&status.status))
+            .unwrap_or(false)
+        {
+            debug!("ibkr order {} reached final state during submit", order_id);
+            break;
+        }
+    }
+    if let Some(err) = stream.error() {
+        return Err(map_ibkr_error(err));
+    }
+
+    Ok(snapshot)
+}
+
+fn order_result_from_place_snapshot(
+    order_id: i32,
+    order: &BrokerOrderRequest,
+    snapshot: &PlaceOrderSnapshot,
+) -> OrderResult {
+    let status = snapshot
+        .status
+        .as_ref()
+        .map(|status| status.status.clone())
+        .or_else(|| {
+            snapshot
+                .data
+                .as_ref()
+                .and_then(completed_status_from_order_data)
+        })
+        .unwrap_or_else(|| "Submitted".into());
+
+    OrderResult {
+        broker_order_id: order_id.to_string(),
+        client_order_id: order.client_order_id.clone(),
+        status,
+        filled_qty: snapshot
+            .status
+            .as_ref()
+            .and_then(|status| positive_or_none(status.filled))
+            .or_else(|| {
+                snapshot
+                    .execution
+                    .as_ref()
+                    .and_then(|execution| positive_or_none(execution.execution.cumulative_quantity))
+            }),
+        avg_price: snapshot
+            .status
+            .as_ref()
+            .and_then(|status| positive_or_none(status.average_fill_price))
+            .or_else(|| {
+                snapshot
+                    .execution
+                    .as_ref()
+                    .and_then(|execution| positive_or_none(execution.execution.average_price))
+            })
+            .or(order.limit_price),
+        message: snapshot.message.clone(),
+        raw_metadata: json!({
+            "symbol": order.instrument.broker_symbol,
+            "requested_qty": order.quantity,
+            "broker_order_id": order_id,
+            "account": snapshot
+                .data
+                .as_ref()
+                .map(|data| data.order.account.clone())
+                .unwrap_or_default(),
+            "order_ref": snapshot
+                .data
+                .as_ref()
+                .map(|data| data.order.order_ref.clone())
+                .unwrap_or_else(|| order.client_tag.clone().unwrap_or_else(|| order.client_order_id.clone())),
+        }),
+    }
+}
+
+fn order_status_snapshot_from_order_row(
+    order_id: i32,
+    row: OrderSnapshotData,
+) -> OrderStatusSnapshot {
+    let status = row
+        .status
+        .as_ref()
+        .map(|status| status.status.clone())
+        .or_else(|| row.data.as_ref().and_then(completed_status_from_order_data))
+        .unwrap_or_else(|| "Unknown".into());
+    let filled_qty = row
+        .status
+        .as_ref()
+        .and_then(|status| positive_or_none(status.filled));
+    let remaining_qty = row
+        .status
+        .as_ref()
+        .and_then(|status| positive_or_none(status.remaining));
+    let avg_price = row
+        .status
+        .as_ref()
+        .and_then(|status| positive_or_none(status.average_fill_price));
+
+    let symbol = row
+        .data
+        .as_ref()
+        .map(|data| contract_display_symbol(&data.contract))
+        .unwrap_or_default();
+    let requested_qty = row
+        .data
+        .as_ref()
+        .and_then(|data| positive_or_none(data.order.total_quantity));
+
+    OrderStatusSnapshot {
+        broker_order_id: order_id.to_string(),
+        status: status.clone(),
+        filled_qty,
+        remaining_qty,
+        avg_price,
+        message: row.notice,
+        is_active: !ibkr_status_is_final(&status),
+        is_final: ibkr_status_is_final(&status),
+        raw_metadata: json!({
+            "symbol": symbol,
+            "requested_qty": requested_qty,
+            "broker_order_id": order_id,
+            "account": row
+                .data
+                .as_ref()
+                .map(|data| data.order.account.clone())
+                .unwrap_or_default(),
+            "order_ref": row
+                .data
+                .as_ref()
+                .map(|data| data.order.order_ref.clone())
+                .unwrap_or_default(),
+        }),
+    }
+}
+
+fn merge_order_snapshot_row(existing: &mut OrderSnapshotData, incoming: &OrderSnapshotData) {
+    if existing.data.is_none() {
+        existing.data = incoming.data.clone();
+    }
+    if existing.status.is_none() {
+        existing.status = incoming.status.clone();
+    }
+    if existing.notice.is_none() {
+        existing.notice = incoming.notice.clone();
+    }
+}
+
+fn order_row_matches_account(row: &OrderSnapshotData, account_id: &str) -> bool {
+    row.data
+        .as_ref()
+        .map(|data| data.order.account == account_id)
+        .unwrap_or(true)
+}
+
+fn contract_from_resolved(instrument: &ResolvedInstrument) -> Result<Contract> {
+    let symbol = instrument
+        .broker_symbol
+        .split('.')
+        .next()
+        .unwrap_or(instrument.broker_symbol.as_str());
+    let mut contract = contract_template(symbol, instrument.market);
+
+    if let Some(conid) = instrument.conid.as_deref() {
+        contract.contract_id = conid.parse::<i32>().map_err(|_| {
+            TradeBotError::Validation(format!(
+                "invalid IBKR conid `{conid}` for `{}`",
+                instrument.broker_symbol
+            ))
+        })?;
+    }
+
+    Ok(contract)
+}
+
+fn contract_template(symbol: &str, market: Market) -> Contract {
+    let builder = Contract::stock(symbol)
+        .on_exchange(market_exchange(market))
+        .in_currency(market_currency(market));
+
+    match market_primary_exchange(market) {
+        Some(primary_exchange) => builder.primary(primary_exchange).build(),
+        None => builder.build(),
+    }
+}
+
+fn contract_matches(contract: &Contract, instrument: &ResolvedInstrument) -> bool {
+    instrument
+        .conid
+        .as_deref()
+        .and_then(|conid| conid.parse::<i32>().ok())
+        .map(|conid| contract.contract_id == conid)
+        .unwrap_or_else(|| {
+            contract
+                .symbol
+                .to_string()
+                .eq_ignore_ascii_case(&instrument.ticker)
+                || contract_display_symbol(contract).eq_ignore_ascii_case(&instrument.broker_symbol)
+        })
+}
+
+fn contract_display_symbol(contract: &Contract) -> String {
+    let local_symbol = contract.local_symbol.to_string();
+    if !local_symbol.trim().is_empty() {
+        return local_symbol;
+    }
+    contract.symbol.to_string()
+}
+
+fn market_exchange(market: Market) -> &'static str {
+    match market {
+        Market::Us => "SMART",
+        Market::Hk => "SEHK",
+    }
+}
+
+fn market_primary_exchange(market: Market) -> Option<&'static str> {
+    match market {
+        Market::Us => None,
+        Market::Hk => Some("SEHK"),
+    }
+}
+
+fn market_currency(market: Market) -> &'static str {
+    match market {
+        Market::Us => "USD",
+        Market::Hk => "HKD",
+    }
+}
+
+fn normalize_position_qty(quantity: f64) -> Result<u64> {
+    if quantity <= 0.0 {
+        return Ok(0);
+    }
+    Ok(quantity.floor() as u64)
+}
+
+fn positive_or_none(value: f64) -> Option<f64> {
+    (value > 0.0).then_some(value)
+}
+
+fn has_quote_value(quote: &Quote) -> bool {
+    quote.bid.is_some() || quote.ask.is_some() || quote.last.is_some()
+}
+
+fn snapshot_quote(client: &Client, contract: &Contract, market: Market) -> Result<Quote> {
+    let stream = client
+        .market_data(contract)
+        .snapshot()
+        .subscribe()
+        .map_err(map_ibkr_error)?;
+
+    let mut quote = Quote {
+        bid: None,
+        ask: None,
+        last: None,
+        currency: Some(market_currency(market).to_string()),
+    };
+
+    while let Some(update) = stream.next_timeout(SUBSCRIPTION_TIMEOUT) {
+        match update {
+            TickTypes::Price(tick) => apply_quote_tick(&mut quote, tick.tick_type, tick.price),
+            TickTypes::PriceSize(tick) => {
+                apply_quote_tick(&mut quote, tick.price_tick_type, tick.price)
+            }
+            _ => {}
+        }
+    }
+    if let Some(err) = stream.error() {
+        return Err(map_ibkr_error(err));
+    }
+
+    Ok(quote)
+}
+
+fn apply_quote_tick(quote: &mut Quote, tick_type: TickType, price: f64) {
+    match tick_type {
+        TickType::Bid | TickType::DelayedBid => quote.bid = positive_or_none(price),
+        TickType::Ask | TickType::DelayedAsk => quote.ask = positive_or_none(price),
+        TickType::Last | TickType::DelayedLast => quote.last = positive_or_none(price),
+        _ => {}
+    }
+}
+
+fn completed_status_from_order_data(data: &OrderData) -> Option<String> {
+    if !data.order_state.completed_status.is_empty() {
+        Some(data.order_state.completed_status.clone())
+    } else if !data.order_state.status.is_empty() {
+        Some(data.order_state.status.clone())
+    } else {
+        None
+    }
+}
+
+fn map_time_in_force(tif: TimeInForce) -> IbTimeInForce {
+    match tif {
+        TimeInForce::Day => IbTimeInForce::Day,
+        TimeInForce::Gtc => IbTimeInForce::GoodTilCanceled,
+    }
+}
+
+fn parse_order_id(broker_order_id: &str) -> Result<i32> {
+    broker_order_id.parse::<i32>().map_err(|_| {
+        TradeBotError::Validation(format!(
+            "IBKR broker_order_id `{broker_order_id}` is not a valid integer order id"
+        ))
+    })
+}
+
+fn map_ibkr_error(err: ibapi::Error) -> TradeBotError {
+    TradeBotError::broker("ibkr", err.to_string())
 }
 
 fn required_env(
@@ -488,79 +858,96 @@ fn required_env(
     }
 }
 
-fn optional_bool_env(
+fn optional_env(config: &BrokerConfig, default_name: &str, suffix: &str) -> Option<String> {
+    std::env::var(config.env_var_name(default_name, suffix))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn optional_u16_env(
     config: &BrokerConfig,
     default_name: &str,
     suffix: &str,
-    default: bool,
+    default: u16,
     broker: &str,
-) -> Result<bool> {
+) -> Result<u16> {
     let name = config.env_var_name(default_name, suffix);
     match std::env::var(&name) {
-        Ok(value) => parse_env_bool(&name, &value, broker),
+        Ok(value) => value.trim().parse::<u16>().map_err(|_| {
+            TradeBotError::broker(
+                broker,
+                format!("environment variable `{name}` must be a valid u16"),
+            )
+        }),
         Err(_) => Ok(default),
     }
 }
 
-fn parse_env_bool(name: &str, value: &str, broker: &str) -> Result<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => Err(TradeBotError::broker(
-            broker,
-            format!("environment variable `{name}` must be a boolean"),
-        )),
+fn optional_i32_env(
+    config: &BrokerConfig,
+    default_name: &str,
+    suffix: &str,
+    default: i32,
+    broker: &str,
+) -> Result<i32> {
+    let name = config.env_var_name(default_name, suffix);
+    match std::env::var(&name) {
+        Ok(value) => value.trim().parse::<i32>().map_err(|_| {
+            TradeBotError::broker(
+                broker,
+                format!("environment variable `{name}` must be a valid i32"),
+            )
+        }),
+        Err(_) => Ok(default),
     }
 }
 
-fn parse_ibkr_number(value: Option<&Value>) -> Option<f64> {
-    match value {
-        Some(Value::String(raw)) => raw.replace(',', "").parse::<f64>().ok(),
-        Some(Value::Number(num)) => num.as_f64(),
-        _ => None,
-    }
-}
-
-fn with_standard_order_metadata(
-    raw: Value,
-    symbol: Option<&str>,
-    requested_qty: Option<f64>,
-) -> Value {
-    let mut object = match raw {
-        Value::Object(object) => object,
-        payload => {
-            let mut object = serde_json::Map::new();
-            object.insert("broker_payload".into(), payload);
-            object
-        }
+fn matches_cancel_filter(row: &OrderSnapshotData, request: &CancelRequest) -> bool {
+    let Some(data) = &row.data else {
+        return false;
     };
 
-    if let Some(symbol) = symbol {
-        object.insert("symbol".into(), Value::String(symbol.to_string()));
-    }
-    if let Some(requested_qty) = requested_qty {
-        object.insert("requested_qty".into(), json!(requested_qty));
-    }
+    let symbol = contract_display_symbol(&data.contract);
+    let conid = data.contract.contract_id.to_string();
 
-    Value::Object(object)
-}
+    let symbol_match = request.all_open
+        || request.instruments.iter().any(|instrument| {
+            instrument.ticker.eq_ignore_ascii_case(&symbol)
+                || instrument.broker_symbol.eq_ignore_ascii_case(&symbol)
+                || instrument
+                    .conid
+                    .as_deref()
+                    .map(|candidate| candidate == conid)
+                    .unwrap_or(false)
+        });
 
-fn row_symbol(row: &Value) -> Option<&str> {
-    row.get("ticker")
-        .or_else(|| row.get("symbol"))
-        .and_then(Value::as_str)
-}
+    let side_match = request.side.map_or(true, |side| {
+        data.order
+            .action
+            .to_string()
+            .eq_ignore_ascii_case(side.as_uppercase())
+    });
 
-fn row_order_id(row: &Value) -> Result<String> {
-    row.get("orderId")
-        .and_then(value_to_string)
-        .ok_or_else(|| TradeBotError::broker("ibkr", "missing orderId"))
+    let tag_match = request
+        .client_tag
+        .as_ref()
+        .map_or(true, |client_tag| data.order.order_ref == *client_tag);
+
+    symbol_match && side_match && tag_match
 }
 
 fn ibkr_status_is_final(status: &str) -> bool {
     matches!(
         status.to_ascii_lowercase().as_str(),
-        "filled" | "cancelled" | "canceled" | "inactive" | "rejected" | "expired"
+        "filled"
+            | "cancelled"
+            | "canceled"
+            | "inactive"
+            | "rejected"
+            | "expired"
+            | "apicancelled"
+            | "apicanceled"
     )
 }
 
@@ -570,7 +957,7 @@ mod tests {
 
     use trading_core::BrokerConfig;
 
-    use super::{optional_bool_env, required_env};
+    use super::{optional_i32_env, optional_u16_env, required_env};
 
     #[test]
     fn resolves_legacy_ibkr_env_names_without_prefix() {
@@ -597,78 +984,20 @@ mod tests {
     }
 
     #[test]
-    fn uses_defaults_for_missing_prefixed_optional_bools() {
+    fn uses_defaults_for_missing_prefixed_optional_envs() {
         let config = BrokerConfig {
             kind: "ibkr".into(),
             env_prefix: Some("IBKR_MAIN".into()),
             settings: BTreeMap::new(),
         };
 
-        assert!(
-            !optional_bool_env(
-                &config,
-                "IBKR_ALLOW_INSECURE_TLS",
-                "ALLOW_INSECURE_TLS",
-                false,
-                "ibkr",
-            )
-            .unwrap()
+        assert_eq!(
+            optional_u16_env(&config, "IBKR_PORT", "PORT", 4001, "ibkr").unwrap(),
+            4001
         );
-        assert!(
-            optional_bool_env(
-                &config,
-                "IBKR_AUTO_CONFIRM_REPLIES",
-                "AUTO_CONFIRM_REPLIES",
-                true,
-                "ibkr",
-            )
-            .unwrap()
+        assert_eq!(
+            optional_i32_env(&config, "IBKR_CLIENT_ID", "CLIENT_ID", 100, "ibkr").unwrap(),
+            100
         );
     }
-}
-
-fn parse_conid_value(conid: Option<&str>) -> Value {
-    conid
-        .and_then(|raw| raw.parse::<i64>().ok())
-        .map_or(Value::Null, |parsed| json!(parsed))
-}
-
-fn value_to_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(raw) => Some(raw.clone()),
-        Value::Number(num) => Some(num.to_string()),
-        _ => None,
-    }
-}
-
-fn matches_cancel_filter(row: &Value, request: &CancelRequest) -> bool {
-    let symbol_match = request.all_open
-        || request.instruments.iter().any(|instrument| {
-            row.get("ticker")
-                .and_then(Value::as_str)
-                .map(|ticker| ticker.eq_ignore_ascii_case(&instrument.ticker))
-                .unwrap_or(false)
-                || row
-                    .get("conid")
-                    .and_then(value_to_string)
-                    .zip(instrument.conid.clone())
-                    .map(|(left, right)| left == right)
-                    .unwrap_or(false)
-        });
-
-    let side_match = request.side.map_or(true, |side| {
-        row.get("side")
-            .and_then(Value::as_str)
-            .map(|raw| raw.eq_ignore_ascii_case(side.as_uppercase()))
-            .unwrap_or(false)
-    });
-
-    let tag_match = request.client_tag.as_ref().map_or(true, |client_tag| {
-        row.get("order_ref")
-            .and_then(Value::as_str)
-            .map(|raw| raw == client_tag)
-            .unwrap_or(false)
-    });
-
-    symbol_match && side_match && tag_match
 }

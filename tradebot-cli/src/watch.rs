@@ -21,9 +21,8 @@ pub fn watch(
     poll_seconds: u64,
 ) -> Result<()> {
     let source = WatchSource::from_args(config_path, config_dir)?;
-    let poll_interval = Duration::from_secs(poll_seconds.max(1));
-    let reload_debounce = Duration::from_secs(1);
     let mut state = WatchState::load(source.clone())?;
+    let poll_interval = Duration::from_secs(poll_seconds.max(1));
     let (_watcher, rx) = build_watcher(&source)?;
     let mut pending_reload_at: Option<Instant> = None;
 
@@ -31,7 +30,7 @@ pub fn watch(
         source = %source.display(),
         timezone = %state.schedule_timezone(),
         poll_seconds = poll_interval.as_secs(),
-        reload_debounce_seconds = reload_debounce.as_secs(),
+        reload_debounce_seconds = state.reload_debounce().as_secs(),
         watch_root = %source.watch_root().display(),
         "watching config for scheduled tasks"
     );
@@ -45,7 +44,7 @@ pub fn watch(
             Ok(Ok(event)) => {
                 if source.should_reload_for_event(&event) {
                     drain_ready_events(&rx);
-                    pending_reload_at = Some(Instant::now() + reload_debounce);
+                    pending_reload_at = Some(Instant::now() + state.reload_debounce());
                 }
             }
             Ok(Err(err)) => {
@@ -64,6 +63,12 @@ pub fn watch(
         }
         state.run_due_tasks();
     }
+}
+
+pub fn load_app_config(config_path: Option<PathBuf>, config_dir: Option<PathBuf>) -> Result<AppConfig> {
+    Ok(WatchSource::from_args(config_path, config_dir)?
+        .load_snapshot()?
+        .config)
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +310,10 @@ impl WatchState {
             .defaults
             .parse_timezone()
             .expect("validated config must contain a valid timezone")
+    }
+
+    fn reload_debounce(&self) -> Duration {
+        Duration::from_secs(self.config.watch.reload_debounce_seconds)
     }
 
     fn log_scheduled_tasks(&self, verb: &str) {
