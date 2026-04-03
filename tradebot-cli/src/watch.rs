@@ -65,7 +65,10 @@ pub fn watch(
     }
 }
 
-pub fn load_app_config(config_path: Option<PathBuf>, config_dir: Option<PathBuf>) -> Result<AppConfig> {
+pub fn load_app_config(
+    config_path: Option<PathBuf>,
+    config_dir: Option<PathBuf>,
+) -> Result<AppConfig> {
     Ok(WatchSource::from_args(config_path, config_dir)?
         .load_snapshot()?
         .config)

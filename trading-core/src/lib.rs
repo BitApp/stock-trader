@@ -18,7 +18,7 @@ pub use errors::{Result, TradeBotError};
 pub use models::{
     BrokerHealth, BrokerOrderRequest, BrokerOrderType, CancelOrderReport, CancelRequest,
     CancelResult, ExecutionPolicy, ExecutionResult, InstrumentRef, Market, OpenOrdersReport,
-    OrderResult, OrderSide, OrderStatusReport, OrderStatusSnapshot, PositionSnapshot,
-    PricingSpec, Quote, ResolvedInstrument, RiskPolicy, SessionPolicy, SharedBudget,
-    SymbolTarget, TaskAction, TimeInForce, ValidationReport,
+    OrderResult, OrderSide, OrderStatusReport, OrderStatusSnapshot, PositionSnapshot, PricingSpec,
+    Quote, ResolvedInstrument, RiskPolicy, SessionPolicy, SharedBudget, SymbolTarget, TaskAction,
+    TimeInForce, ValidationReport,
 };

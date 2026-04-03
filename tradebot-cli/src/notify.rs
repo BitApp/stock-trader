@@ -10,8 +10,8 @@ use serde_json::json;
 use tokio::runtime::Builder;
 use tracing::warn;
 use trading_core::{
-    AppConfig, ExecutionResult, NotificationEvent, OrderResult, TaskAction, TaskConfig,
-    WatchNotificationEvent,
+    AppConfig, ExecutionResult, NotificationEvent, OrderResult, SymbolTarget, TaskAction,
+    TaskConfig, WatchNotificationEvent,
 };
 
 const EMAIL_REGION_ENV: &str = "TRADEBOT_EMAIL_REGION";
@@ -812,21 +812,7 @@ fn format_task_summary_lines(tasks: &[TaskConfig]) -> String {
 
     tasks
         .iter()
-        .map(|task| {
-            let schedule = task
-                .schedule
-                .as_ref()
-                .map(format_task_schedule_summary)
-                .unwrap_or_else(|| "manual".into());
-            format!(
-                "- [{}] {} | broker={} | side={} | {}",
-                task_state_label(task_display_state(task)),
-                task.name,
-                task.broker,
-                format_task_side(task.side),
-                schedule
-            )
-        })
+        .map(format_task_summary_line)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1060,14 +1046,21 @@ fn format_task_summary_line(task: &TaskConfig) -> String {
         .as_ref()
         .map(format_task_schedule_summary)
         .unwrap_or_else(|| "manual".into());
-    format!(
+    let mut lines = vec![format!(
         "- [{}] {} | broker={} | side={} | {}",
         task_state_label(task_display_state(task)),
         task.name,
         task.broker,
         format_task_side(task.side),
         schedule
-    )
+    )];
+    if let Some(trade_summary) = format_task_trade_summary(task) {
+        lines.push(format!("  {trade_summary}"));
+    }
+    if let Some(note) = task_note_summary(task) {
+        lines.push(format!("  note={note}"));
+    }
+    lines.join("\n")
 }
 
 fn format_task_summary_card_html(task: &TaskConfig) -> String {
@@ -1077,16 +1070,95 @@ fn format_task_summary_card_html(task: &TaskConfig) -> String {
         .as_ref()
         .map(format_task_schedule_summary)
         .unwrap_or_else(|| "manual".into());
+    let mut details = vec![
+        format!(
+            "<div style=\"font-size:13px;color:#2d3a4b;\">broker={} | side={}</div>",
+            html_escape(&task.broker),
+            html_escape(format_task_side(task.side)),
+        ),
+        format!(
+            "<div style=\"margin-top:6px;font-size:13px;color:#5f6b7a;\">{}</div>",
+            html_escape(schedule),
+        ),
+    ];
+    if let Some(trade_summary) = format_task_trade_summary(task) {
+        details.push(format!(
+            "<div style=\"margin-top:6px;font-size:13px;color:#5f6b7a;\">{}</div>",
+            html_escape(trade_summary),
+        ));
+    }
+    if let Some(note) = task_note_summary(task) {
+        details.push(format!(
+            "<div style=\"margin-top:6px;font-size:13px;color:#5f6b7a;white-space:pre-wrap;\">note={}</div>",
+            html_escape(note),
+        ));
+    }
     format!(
-        "<div style=\"margin:0 0 12px;padding:14px 16px;{}\"><div style=\"display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:8px;\"><strong>{}</strong><span style=\"{}\">{}</span></div><div style=\"font-size:13px;color:#2d3a4b;\">broker={} | side={}</div><div style=\"margin-top:6px;font-size:13px;color:#5f6b7a;\">{}</div></div>",
+        "<div style=\"margin:0 0 12px;padding:14px 16px;{}\"><div style=\"display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:8px;\"><strong>{}</strong><span style=\"{}\">{}</span></div>{}</div>",
         task_state_card_style(state),
         html_escape(&task.name),
         task_state_badge_style(state),
         html_escape(task_state_label(state)),
-        html_escape(&task.broker),
-        html_escape(format_task_side(task.side)),
-        html_escape(schedule),
+        details.join(""),
     )
+}
+
+fn task_note_summary(task: &TaskConfig) -> Option<&str> {
+    task.note
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty())
+}
+
+fn format_task_trade_summary(task: &TaskConfig) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if let Some(shared_budget) = &task.shared_budget {
+        parts.push(format!("shared_budget={:.4}", shared_budget.amount));
+    }
+
+    if !task.symbols.is_empty() {
+        let symbol_summaries = task
+            .symbols
+            .iter()
+            .map(format_symbol_target_summary)
+            .collect::<Vec<_>>()
+            .join("; ");
+        let label = if task.symbols.len() == 1 {
+            "trade"
+        } else {
+            "trades"
+        };
+        parts.push(format!("{label}={symbol_summaries}"));
+    }
+
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
+fn format_symbol_target_summary(symbol: &SymbolTarget) -> String {
+    let mut parts = vec![symbol.instrument.ticker.clone()];
+
+    if symbol.close_position {
+        parts.push("close_position".into());
+    } else if let Some(quantity) = symbol.quantity {
+        parts.push(format!("qty={quantity}"));
+    } else if let Some(amount) = symbol.amount {
+        parts.push(format!("amount={amount:.4}"));
+    } else if let Some(weight) = symbol.weight {
+        parts.push(format!("weight={weight:.4}"));
+    }
+
+    if let Some(min_quantity) = symbol.min_quantity {
+        parts.push(format!("min_qty={min_quantity}"));
+    }
+    if let Some(quantity_step) = symbol.quantity_step {
+        parts.push(format!("qty_step={quantity_step}"));
+    }
+    if let Some(limit_price) = symbol.limit_price {
+        parts.push(format!("limit={limit_price:.4}"));
+    }
+
+    parts.join(" ")
 }
 
 fn task_state_label(state: TaskDisplayState) -> &'static str {
@@ -1645,7 +1717,7 @@ mod tests {
             name: "base".into(),
             broker: "paper".into(),
             action: TaskAction::Place,
-            note: None,
+            note: Some("core watch note".into()),
             schedule: None,
             execution: None,
             notify: None,
@@ -1657,7 +1729,23 @@ mod tests {
             time_in_force: None,
             client_tag: None,
             all_open: false,
-            symbols: vec![],
+            symbols: vec![SymbolTarget {
+                instrument: InstrumentRef {
+                    ticker: "NVDA".into(),
+                    market: Market::Us,
+                    broker_symbol: None,
+                    conid: None,
+                },
+                close_position: false,
+                quantity: Some(25),
+                amount: None,
+                weight: None,
+                min_quantity: None,
+                quantity_step: None,
+                limit_price: None,
+                client_order_id: None,
+                broker_options: Default::default(),
+            }],
         };
         let config = AppConfig {
             defaults: DefaultsConfig::default(),
@@ -1703,6 +1791,8 @@ mod tests {
         assert!(body.contains("[disabled] disabled-task"));
         assert!(body.contains("[manual] manual-task"));
         assert!(body.contains("broker=paper | side=buy"));
+        assert!(body.contains("trade=NVDA qty=25"));
+        assert!(body.contains("note=core watch note"));
         assert!(!body.contains("action=place"));
 
         assert!(html.contains("Active scheduled tasks"));
@@ -1712,6 +1802,8 @@ mod tests {
         assert!(html.contains(">disabled<"));
         assert!(html.contains(">manual<"));
         assert!(html.contains("broker=paper | side=buy"));
+        assert!(html.contains("trade=NVDA qty=25"));
+        assert!(html.contains("note=core watch note"));
         assert!(!html.contains("action=place"));
     }
 

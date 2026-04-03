@@ -290,7 +290,8 @@ impl Broker for IbkrBroker {
                 snapshot.is_active.then_some(snapshot)
             })
             .collect::<Vec<_>>();
-        snapshots.sort_by_key(|snapshot| snapshot.broker_order_id.parse::<i32>().unwrap_or(i32::MAX));
+        snapshots
+            .sort_by_key(|snapshot| snapshot.broker_order_id.parse::<i32>().unwrap_or(i32::MAX));
         Ok(snapshots)
     }
 }
