@@ -114,6 +114,8 @@ pub struct TaskConfig {
 pub struct WatchConfig {
     #[serde(default = "default_reload_debounce_seconds")]
     pub reload_debounce_seconds: u64,
+    #[serde(default = "default_task_list_confirm_lead_minutes")]
+    pub task_list_confirm_lead_minutes: u64,
     #[serde(default)]
     pub notify: Option<WatchNotificationConfig>,
 }
@@ -122,6 +124,7 @@ impl Default for WatchConfig {
     fn default() -> Self {
         Self {
             reload_debounce_seconds: default_reload_debounce_seconds(),
+            task_list_confirm_lead_minutes: default_task_list_confirm_lead_minutes(),
             notify: None,
         }
     }
@@ -145,6 +148,7 @@ pub struct WatchEmailNotificationConfig {
 pub enum WatchNotificationEvent {
     TaskListLoaded,
     TaskListChanged,
+    TaskListConfirm,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -539,6 +543,10 @@ fn default_reload_debounce_seconds() -> u64 {
     600
 }
 
+fn default_task_list_confirm_lead_minutes() -> u64 {
+    30
+}
+
 impl RawTaskConfig {
     fn expand(self, templates: &BTreeMap<String, TaskFieldsConfig>) -> Result<TaskConfig> {
         let mut fields = self
@@ -889,6 +897,11 @@ impl WatchConfig {
                 "watch.reload_debounce_seconds must be at most 86400".into(),
             ));
         }
+        if self.task_list_confirm_lead_minutes > 24 * 60 {
+            return Err(TradeBotError::Config(
+                "watch.task_list_confirm_lead_minutes must be at most 1440".into(),
+            ));
+        }
 
         let Some(notify) = &self.notify else {
             return Ok(());
@@ -935,6 +948,7 @@ fn watch_notification_event_as_str(event: WatchNotificationEvent) -> &'static st
     match event {
         WatchNotificationEvent::TaskListLoaded => "task_list_loaded",
         WatchNotificationEvent::TaskListChanged => "task_list_changed",
+        WatchNotificationEvent::TaskListConfirm => "task_list_confirm",
     }
 }
 
@@ -1200,12 +1214,14 @@ weight = 1.0
         let mut config = sample_config(sample_task());
         config.watch = WatchConfig {
             reload_debounce_seconds: 600,
+            task_list_confirm_lead_minutes: 30,
             notify: Some(WatchNotificationConfig {
                 email: Some(WatchEmailNotificationConfig {
                     to: vec!["ops@example.com".into()],
                     on: vec![
                         WatchNotificationEvent::TaskListLoaded,
                         WatchNotificationEvent::TaskListChanged,
+                        WatchNotificationEvent::TaskListConfirm,
                     ],
                 }),
             }),
@@ -1231,6 +1247,53 @@ all_open = true
         .unwrap();
 
         assert_eq!(config.watch.reload_debounce_seconds, 600);
+        assert_eq!(config.watch.task_list_confirm_lead_minutes, 30);
+    }
+
+    #[test]
+    fn accepts_custom_task_list_confirm_lead_minutes() {
+        let config = AppConfig::from_toml(
+            r#"
+[watch]
+task_list_confirm_lead_minutes = 45
+
+[brokers.ibkr]
+kind = "ibkr"
+
+[[tasks]]
+name = "test"
+broker = "ibkr"
+action = "cancel"
+all_open = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.watch.task_list_confirm_lead_minutes, 45);
+    }
+
+    #[test]
+    fn rejects_task_list_confirm_lead_minutes_over_one_day() {
+        let err = AppConfig::from_toml(
+            r#"
+[watch]
+task_list_confirm_lead_minutes = 1441
+
+[brokers.ibkr]
+kind = "ibkr"
+
+[[tasks]]
+name = "test"
+broker = "ibkr"
+action = "cancel"
+all_open = true
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, TradeBotError::Config(message) if message.contains("watch.task_list_confirm_lead_minutes must be at most 1440"))
+        );
     }
 
     #[test]

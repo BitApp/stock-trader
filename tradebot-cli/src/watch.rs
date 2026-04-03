@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc, Weekday};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Timelike, Utc, Weekday};
 use chrono_tz::Tz;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info, warn};
@@ -61,6 +61,7 @@ pub fn watch(
             pending_reload_at = None;
             state.reload_if_changed();
         }
+        state.notify_task_list_confirm_if_due();
         state.run_due_tasks();
     }
 }
@@ -167,6 +168,7 @@ struct WatchState {
     engine: TradingEngine,
     last_fingerprint: String,
     last_attempted: BTreeMap<String, NaiveDate>,
+    last_task_list_confirmed: Option<NaiveDate>,
     task_observed_at: BTreeMap<String, DateTime<Utc>>,
     last_checked_at: Option<DateTime<Utc>>,
 }
@@ -188,6 +190,7 @@ impl WatchState {
             source,
             last_fingerprint: snapshot.fingerprint,
             last_attempted: BTreeMap::new(),
+            last_task_list_confirmed: None,
             last_checked_at: None,
         })
     }
@@ -244,6 +247,39 @@ impl WatchState {
             &self.config,
             &self.source.display(),
         );
+    }
+
+    fn notify_task_list_confirm_if_due(&mut self) {
+        let now_utc = Utc::now();
+        let now = now_utc.with_timezone(&self.schedule_timezone());
+        let today = now.date_naive();
+        let previous_check = self
+            .last_checked_at
+            .map(|timestamp| timestamp.with_timezone(&self.schedule_timezone()))
+            .map(|timestamp| (timestamp.date_naive(), timestamp.time()));
+
+        if !task_list_confirm_is_due(
+            &self.config,
+            today,
+            now.weekday(),
+            now.time(),
+            previous_check,
+            self.last_task_list_confirmed,
+        ) {
+            return;
+        }
+
+        self.last_task_list_confirmed = Some(today);
+        if let Some(window) = task_list_confirm_window(&self.config, today, now.weekday()) {
+            info!(
+                source = %self.source.display(),
+                lead_minutes = self.config.watch.task_list_confirm_lead_minutes,
+                confirm_at = %window.confirm_time,
+                first_task_at = %window.first_task_time,
+                "sending task list confirmation notification"
+            );
+        }
+        crate::notify::notify_task_list_confirm(&self.config, &self.source.display());
     }
 
     fn run_due_tasks(&mut self) {
@@ -719,6 +755,82 @@ fn next_watch_wait(
         .unwrap_or(poll_interval)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TaskListConfirmWindow {
+    confirm_time: NaiveTime,
+    first_task_time: NaiveTime,
+}
+
+fn task_list_confirm_is_due(
+    config: &AppConfig,
+    today: NaiveDate,
+    weekday: Weekday,
+    now_time: NaiveTime,
+    previous_check: Option<(NaiveDate, NaiveTime)>,
+    last_confirmed: Option<NaiveDate>,
+) -> bool {
+    if last_confirmed == Some(today) {
+        return false;
+    }
+
+    let Some(window) = task_list_confirm_window(config, today, weekday) else {
+        return false;
+    };
+
+    if now_time < window.confirm_time {
+        return false;
+    }
+
+    if now_time <= window.first_task_time {
+        return true;
+    }
+
+    previous_check.is_some_and(|(date, time)| date < today || time < window.confirm_time)
+}
+
+fn task_list_confirm_window(
+    config: &AppConfig,
+    today: NaiveDate,
+    weekday: Weekday,
+) -> Option<TaskListConfirmWindow> {
+    let first_task_time = config
+        .tasks
+        .iter()
+        .filter_map(|task| task.schedule.as_ref())
+        .filter(|schedule| schedule_matches_day(schedule, today, weekday))
+        .filter_map(|schedule| schedule.parse_time().ok())
+        .min()?;
+
+    let confirm_seconds = first_task_time
+        .num_seconds_from_midnight()
+        .saturating_sub(task_list_confirm_lead_seconds(config));
+    let confirm_time = NaiveTime::from_num_seconds_from_midnight_opt(confirm_seconds, 0)
+        .expect("seconds from midnight must build a valid time");
+
+    Some(TaskListConfirmWindow {
+        confirm_time,
+        first_task_time,
+    })
+}
+
+fn schedule_matches_day(schedule: &TaskScheduleConfig, today: NaiveDate, weekday: Weekday) -> bool {
+    if let Ok(Some(date)) = schedule.parse_date() {
+        if date != today {
+            return false;
+        }
+    }
+
+    schedule.is_enabled_on(weekday)
+}
+
+fn task_list_confirm_lead_seconds(config: &AppConfig) -> u32 {
+    config
+        .watch
+        .task_list_confirm_lead_minutes
+        .saturating_mul(60)
+        .min(u32::MAX as u64) as u32
+}
+
 fn schedule_is_due(
     schedule: &TaskScheduleConfig,
     today: NaiveDate,
@@ -775,6 +887,7 @@ mod tests {
     use super::{
         WatchSource, collect_toml_paths, load_config_dir, next_watch_wait, resolve_watch_path,
         schedule_description, schedule_is_due, scheduled_task_counts, scheduled_task_descriptions,
+        task_list_confirm_is_due, task_list_confirm_window,
     };
 
     fn weekday_only_schedule() -> TaskScheduleConfig {
@@ -934,6 +1047,92 @@ weight = 1.0
             Weekday::Mon,
             NaiveTime::from_hms_opt(9, 31, 0).unwrap(),
             Some((today, NaiveTime::from_hms_opt(9, 30, 1).unwrap())),
+            None,
+        ));
+    }
+
+    #[test]
+    fn task_list_confirm_tracks_earliest_enabled_task_for_today() {
+        let today = NaiveDate::from_ymd_opt(2026, 3, 16).unwrap();
+        let config = AppConfig::from_toml(
+            r#"
+[defaults]
+timezone = "UTC"
+
+[watch]
+task_list_confirm_lead_minutes = 45
+
+[brokers.paper]
+kind = "ibkr"
+
+[[tasks]]
+name = "later"
+broker = "paper"
+action = "place"
+schedule = { time = "10:15", weekdays = ["mon"] }
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks.symbols]]
+ticker = "AAPL"
+market = "us"
+weight = 1.0
+
+[[tasks]]
+name = "open"
+broker = "paper"
+action = "place"
+schedule = { time = "09:30", weekdays = ["mon"] }
+side = "buy"
+pricing = { kind = "counterparty" }
+shared_budget = { amount = 1000.0 }
+
+[[tasks.symbols]]
+ticker = "MSFT"
+market = "us"
+weight = 1.0
+"#,
+        )
+        .unwrap();
+
+        let window = task_list_confirm_window(&config, today, Weekday::Mon).unwrap();
+        assert_eq!(
+            window.confirm_time,
+            NaiveTime::from_hms_opt(8, 45, 0).unwrap()
+        );
+        assert_eq!(
+            window.first_task_time,
+            NaiveTime::from_hms_opt(9, 30, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn task_list_confirm_does_not_backfill_on_late_start_after_first_task() {
+        let today = NaiveDate::from_ymd_opt(2026, 3, 16).unwrap();
+        let config = AppConfig::from_toml(&sample_config("buy-aapl", "paper", "UTC")).unwrap();
+
+        assert!(!task_list_confirm_is_due(
+            &config,
+            today,
+            Weekday::Mon,
+            NaiveTime::from_hms_opt(9, 45, 0).unwrap(),
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn task_list_confirm_sends_catch_up_if_watch_crosses_window() {
+        let today = NaiveDate::from_ymd_opt(2026, 3, 16).unwrap();
+        let config = AppConfig::from_toml(&sample_config("buy-aapl", "paper", "UTC")).unwrap();
+
+        assert!(task_list_confirm_is_due(
+            &config,
+            today,
+            Weekday::Mon,
+            NaiveTime::from_hms_opt(9, 31, 0).unwrap(),
+            Some((today, NaiveTime::from_hms_opt(8, 59, 0).unwrap())),
             None,
         ));
     }

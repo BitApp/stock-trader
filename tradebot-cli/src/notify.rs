@@ -131,6 +131,19 @@ pub fn notify_task_list_changed(previous: &AppConfig, current: &AppConfig, sourc
     );
 }
 
+pub fn notify_task_list_confirm(config: &AppConfig, source: &str) {
+    let subject = format_watch_subject(config, "task list confirm");
+    let body = format_task_list_confirm_body(config, source);
+    let html_body = format_task_list_confirm_html(config, source);
+    dispatch_watch_notification(
+        config,
+        WatchNotificationEvent::TaskListConfirm,
+        &subject,
+        &body,
+        &html_body,
+    );
+}
+
 pub fn preview_notification(
     config: &AppConfig,
     task: &TaskConfig,
@@ -446,6 +459,14 @@ fn format_partial_filled_html(
 }
 
 fn format_task_list_loaded_body(config: &AppConfig, source: &str) -> String {
+    format_task_list_overview_body(config, source, "Task list loaded.")
+}
+
+fn format_task_list_confirm_body(config: &AppConfig, source: &str) -> String {
+    format_task_list_overview_body(config, source, "Task list confirm.")
+}
+
+fn format_task_list_overview_body(config: &AppConfig, source: &str, headline: &str) -> String {
     let timestamp = timestamp_in_config_timezone(config);
     let counts = task_list_counts(config);
     let active =
@@ -456,12 +477,20 @@ fn format_task_list_loaded_body(config: &AppConfig, source: &str) -> String {
         format_task_summary_lines(&tasks_with_state(&config.tasks, TaskDisplayState::Manual));
 
     format!(
-        "Task list loaded.\n\nSummary\nTime: {timestamp}\nSource: {source}\nEnabled scheduled tasks: {}/{}\n\nActive scheduled tasks\n{active}\n\nDisabled scheduled tasks\n{disabled}\n\nManual tasks\n{manual}",
+        "{headline}\n\nSummary\nTime: {timestamp}\nSource: {source}\nEnabled scheduled tasks: {}/{}\n\nActive scheduled tasks\n{active}\n\nDisabled scheduled tasks\n{disabled}\n\nManual tasks\n{manual}",
         counts.enabled, counts.total
     )
 }
 
 fn format_task_list_loaded_html(config: &AppConfig, source: &str) -> String {
+    format_task_list_overview_html(config, source, "Task list loaded")
+}
+
+fn format_task_list_confirm_html(config: &AppConfig, source: &str) -> String {
+    format_task_list_overview_html(config, source, "Task list confirm")
+}
+
+fn format_task_list_overview_html(config: &AppConfig, source: &str, headline: &str) -> String {
     let timestamp = timestamp_in_config_timezone(config);
     let counts = task_list_counts(config);
     let active_html =
@@ -472,7 +501,8 @@ fn format_task_list_loaded_html(config: &AppConfig, source: &str) -> String {
         format_task_summary_list_html(&tasks_with_state(&config.tasks, TaskDisplayState::Manual));
 
     format!(
-        "<!doctype html><html><body style=\"margin:0;padding:0;background:#f5f7fb;color:#132033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;\"><div style=\"max-width:760px;margin:0 auto;padding:24px 16px;\"><div style=\"background:#ffffff;border:1px solid #d8e0eb;border-radius:14px;padding:24px;\"><div style=\"font-size:13px;letter-spacing:0.08em;text-transform:uppercase;color:#7a8798;\">Tradebot</div><h1 style=\"margin:8px 0 20px;font-size:24px;line-height:1.3;\">Task list loaded</h1><table style=\"width:100%;border-collapse:collapse;font-size:14px;\"><tr><td style=\"padding:8px 0;color:#5f6b7a;width:180px;\">Time</td><td style=\"padding:8px 0;\">{timestamp}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Source</td><td style=\"padding:8px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;\">{source}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Enabled scheduled tasks</td><td style=\"padding:8px 0;\">{enabled}/{total}</td></tr></table><h2 style=\"margin:24px 0 8px;font-size:16px;color:#0f5c44;\">Active scheduled tasks</h2>{active_html}<h2 style=\"margin:24px 0 8px;font-size:16px;color:#7a5d00;\">Disabled scheduled tasks</h2>{disabled_html}<h2 style=\"margin:24px 0 8px;font-size:16px;color:#5f6b7a;\">Manual tasks</h2>{manual_html}</div></div></body></html>",
+        "<!doctype html><html><body style=\"margin:0;padding:0;background:#f5f7fb;color:#132033;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;\"><div style=\"max-width:760px;margin:0 auto;padding:24px 16px;\"><div style=\"background:#ffffff;border:1px solid #d8e0eb;border-radius:14px;padding:24px;\"><div style=\"font-size:13px;letter-spacing:0.08em;text-transform:uppercase;color:#7a8798;\">Tradebot</div><h1 style=\"margin:8px 0 20px;font-size:24px;line-height:1.3;\">{headline}</h1><table style=\"width:100%;border-collapse:collapse;font-size:14px;\"><tr><td style=\"padding:8px 0;color:#5f6b7a;width:180px;\">Time</td><td style=\"padding:8px 0;\">{timestamp}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Source</td><td style=\"padding:8px 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;\">{source}</td></tr><tr><td style=\"padding:8px 0;color:#5f6b7a;\">Enabled scheduled tasks</td><td style=\"padding:8px 0;\">{enabled}/{total}</td></tr></table><h2 style=\"margin:24px 0 8px;font-size:16px;color:#0f5c44;\">Active scheduled tasks</h2>{active_html}<h2 style=\"margin:24px 0 8px;font-size:16px;color:#7a5d00;\">Disabled scheduled tasks</h2>{disabled_html}<h2 style=\"margin:24px 0 8px;font-size:16px;color:#5f6b7a;\">Manual tasks</h2>{manual_html}</div></div></body></html>",
+        headline = html_escape(headline),
         timestamp = html_escape(&timestamp),
         source = html_escape(source),
         enabled = counts.enabled,
@@ -1408,7 +1438,8 @@ mod tests {
     };
 
     use super::{
-        format_task_list_changed_body, format_task_list_changed_html, format_task_list_loaded_body,
+        format_task_list_changed_body, format_task_list_changed_html,
+        format_task_list_confirm_body, format_task_list_confirm_html, format_task_list_loaded_body,
         format_task_list_loaded_html, preview_notification, task_list_change_details,
         task_result_is_filled, task_result_is_partially_filled,
     };
@@ -1574,12 +1605,14 @@ mod tests {
     fn sample_watch_config() -> WatchConfig {
         WatchConfig {
             reload_debounce_seconds: 600,
+            task_list_confirm_lead_minutes: 30,
             notify: Some(WatchNotificationConfig {
                 email: Some(WatchEmailNotificationConfig {
                     to: vec!["ops@example.com".into()],
                     on: vec![
                         WatchNotificationEvent::TaskListLoaded,
                         WatchNotificationEvent::TaskListChanged,
+                        WatchNotificationEvent::TaskListConfirm,
                     ],
                 }),
             }),
@@ -1805,6 +1838,22 @@ mod tests {
         assert!(html.contains("trade=NVDA qty=25"));
         assert!(html.contains("note=core watch note"));
         assert!(!html.contains("action=place"));
+    }
+
+    #[test]
+    fn task_list_confirm_uses_confirm_headline() {
+        let config = AppConfig {
+            defaults: DefaultsConfig::default(),
+            watch: sample_watch_config(),
+            brokers: Default::default(),
+            tasks: vec![],
+        };
+
+        let body = format_task_list_confirm_body(&config, "config/oneshot-tasks/*.toml");
+        let html = format_task_list_confirm_html(&config, "config/oneshot-tasks/*.toml");
+
+        assert!(body.contains("Task list confirm."));
+        assert!(html.contains("Task list confirm"));
     }
 
     #[test]

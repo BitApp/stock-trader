@@ -173,12 +173,15 @@ Supported notification events are:
 The watcher can also send email when the effective task list is loaded or changes after a config reload:
 
 ```toml
+[watch]
+task_list_confirm_lead_minutes = 30
+
 [watch.notify.email]
 to = ["ops@example.com"]
-on = ["task_list_loaded", "task_list_changed"]
+on = ["task_list_loaded", "task_list_changed", "task_list_confirm"]
 ```
 
-`task_list_loaded` fires after the initial successful load, and `task_list_changed` fires after a successful reload that changes any expanded task config.
+`task_list_loaded` fires after the initial successful load, and `task_list_changed` fires after a successful reload that changes any expanded task config. `task_list_confirm` fires once per local weekday when the watcher reaches the configured lead window before that day's earliest enabled scheduled task, and sends the current effective task list.
 
 The SES transport reads these environment variables at runtime:
 

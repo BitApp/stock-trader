@@ -5,9 +5,12 @@ default_tif = "day"
 [defaults.email]
 subject_prefix = "[stock-trader]"
 
+[watch]
+task_list_confirm_lead_minutes = 30
+
 [watch.notify.email]
 to = ["ops@example.com"]
-on = ["task_list_loaded", "task_list_changed"]
+on = ["task_list_loaded", "task_list_changed", "task_list_confirm"]
 
 [brokers.longbridge]
 kind = "longbridge"
