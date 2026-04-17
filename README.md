@@ -77,6 +77,9 @@ Broker connectivity now comes from environment variables rather than inline brok
 export LONGPORT_APP_KEY=...
 export LONGPORT_APP_SECRET=...
 export LONGPORT_ACCESS_TOKEN=...
+export LONGPORT_HTTP_URL=https://openapi.longportapp.com
+export LONGPORT_QUOTE_WS_URL=wss://openapi-quote.longportapp.com/v2
+export LONGPORT_TRADE_WS_URL=wss://openapi-trade.longportapp.com/v2
 
 export IBKR_HOST=127.0.0.1
 export IBKR_PORT=4001
@@ -106,10 +109,16 @@ These broker instances will read:
 export LONGPORT_MAIN_APP_KEY=...
 export LONGPORT_MAIN_APP_SECRET=...
 export LONGPORT_MAIN_ACCESS_TOKEN=...
+export LONGPORT_MAIN_HTTP_URL=https://openapi.longportapp.com
+export LONGPORT_MAIN_QUOTE_WS_URL=wss://openapi-quote.longportapp.com/v2
+export LONGPORT_MAIN_TRADE_WS_URL=wss://openapi-trade.longportapp.com/v2
 
 export LONGPORT_ALT_APP_KEY=...
 export LONGPORT_ALT_APP_SECRET=...
 export LONGPORT_ALT_ACCESS_TOKEN=...
+export LONGPORT_ALT_HTTP_URL=https://openapi.longportapp.com
+export LONGPORT_ALT_QUOTE_WS_URL=wss://openapi-quote.longportapp.com/v2
+export LONGPORT_ALT_TRADE_WS_URL=wss://openapi-trade.longportapp.com/v2
 
 export IBKR_MAIN_HOST=127.0.0.1
 export IBKR_MAIN_PORT=4001
@@ -118,6 +127,7 @@ export IBKR_MAIN_ACCOUNT_ID=DU123456
 ```
 
 When `env_prefix` is omitted, the runtime keeps using the legacy variable names such as `LONGPORT_APP_KEY` and `IBKR_ACCOUNT_ID`.
+Longbridge also reads optional endpoint overrides from the environment, so if your network requires the mainland endpoints you can point the broker at `https://openapi.longportapp.cn`, `wss://openapi-quote.longportapp.cn/v2`, and `wss://openapi-trade.longportapp.cn/v2` via either the legacy `LONGPORT_*` names or the prefixed `*_HTTP_URL` / `*_QUOTE_WS_URL` / `*_TRADE_WS_URL` variants.
 
 Repeated task fields can be extracted into reusable templates:
 

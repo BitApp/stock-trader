@@ -1,7 +1,7 @@
 use std::{env, sync::Arc};
 
 use longport::{
-    Config as LongportConfig, Decimal,
+    Config as LongportConfig, Decimal, Language as LongportLanguage,
     blocking::{QuoteContextSync, TradeContextSync},
     trade::{
         GetStockPositionsOptions, GetTodayOrdersOptions, OrderDetail as LongportOrderDetail,
@@ -322,7 +322,27 @@ fn build_sdk_config(config: &BrokerConfig) -> Result<LongportConfig> {
             )
         })?;
 
-    Ok(LongportConfig::new(app_key, app_secret, access_token).dont_print_quote_packages())
+    let mut sdk_config =
+        LongportConfig::new(app_key, app_secret, access_token).dont_print_quote_packages();
+
+    if let Some(http_url) = optional_env(config, "LONGPORT_HTTP_URL", "HTTP_URL") {
+        sdk_config = sdk_config.http_url(http_url);
+    }
+    if let Some(quote_ws_url) = optional_env(config, "LONGPORT_QUOTE_WS_URL", "QUOTE_WS_URL") {
+        sdk_config = sdk_config.quote_ws_url(quote_ws_url);
+    }
+    if let Some(trade_ws_url) = optional_env(config, "LONGPORT_TRADE_WS_URL", "TRADE_WS_URL") {
+        sdk_config = sdk_config.trade_ws_url(trade_ws_url);
+    }
+    if let Some(language) = optional_language_env(config)? {
+        sdk_config = sdk_config.language(language);
+    }
+    if optional_bool_env(config, "LONGPORT_ENABLE_OVERNIGHT", "ENABLE_OVERNIGHT")?.unwrap_or(false)
+    {
+        sdk_config = sdk_config.enable_overnight();
+    }
+
+    Ok(sdk_config)
 }
 
 fn validate_settings(config: &BrokerConfig) -> Result<()> {
@@ -342,6 +362,50 @@ fn required_env(
 ) -> std::result::Result<String, String> {
     let name = config.env_var_name(default_name, suffix);
     env::var(&name).map_err(|_| name)
+}
+
+fn optional_env(config: &BrokerConfig, default_name: &str, suffix: &str) -> Option<String> {
+    env::var(config.env_var_name(default_name, suffix))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn optional_language_env(config: &BrokerConfig) -> Result<Option<LongportLanguage>> {
+    let name = config.env_var_name("LONGPORT_LANGUAGE", "LANGUAGE");
+    match env::var(&name) {
+        Ok(value) => match value.trim() {
+            "" => Ok(None),
+            "zh-CN" => Ok(Some(LongportLanguage::ZH_CN)),
+            "zh-HK" => Ok(Some(LongportLanguage::ZH_HK)),
+            "en" => Ok(Some(LongportLanguage::EN)),
+            _ => Err(TradeBotError::broker(
+                "longbridge",
+                format!("environment variable `{name}` must be one of `zh-CN`, `zh-HK`, or `en`"),
+            )),
+        },
+        Err(_) => Ok(None),
+    }
+}
+
+fn optional_bool_env(
+    config: &BrokerConfig,
+    default_name: &str,
+    suffix: &str,
+) -> Result<Option<bool>> {
+    let name = config.env_var_name(default_name, suffix);
+    match env::var(&name) {
+        Ok(value) => match value.trim() {
+            "" => Ok(None),
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            _ => Err(TradeBotError::broker(
+                "longbridge",
+                format!("environment variable `{name}` must be `true` or `false`"),
+            )),
+        },
+        Err(_) => Ok(None),
+    }
 }
 
 fn map_longbridge_error(err: impl ToString) -> TradeBotError {
@@ -480,7 +544,10 @@ mod tests {
     use longport::trade::OrderStatus as LongportOrderStatus;
     use trading_core::{Broker, BrokerConfig, InstrumentRef, Market};
 
-    use super::{LongbridgeBroker, normalize_order_status, required_env};
+    use super::{
+        LongbridgeBroker, normalize_order_status, optional_bool_env, optional_env,
+        optional_language_env, required_env,
+    };
 
     #[test]
     fn resolves_legacy_longbridge_env_names_without_prefix() {
@@ -504,6 +571,37 @@ mod tests {
 
         let err = required_env(&config, "LONGPORT_APP_KEY", "APP_KEY").unwrap_err();
         assert_eq!(err, "LONGPORT_MAIN_APP_KEY");
+    }
+
+    #[test]
+    fn resolves_prefixed_longbridge_optional_env_names() {
+        let config = BrokerConfig {
+            kind: "longbridge".into(),
+            env_prefix: Some("LONGPORT_MAIN".into()),
+            settings: BTreeMap::new(),
+        };
+
+        unsafe {
+            std::env::set_var("LONGPORT_MAIN_HTTP_URL", "https://openapi.longportapp.cn");
+            std::env::set_var("LONGPORT_MAIN_LANGUAGE", "zh-CN");
+            std::env::set_var("LONGPORT_MAIN_ENABLE_OVERNIGHT", "true");
+        }
+
+        assert_eq!(
+            optional_env(&config, "LONGPORT_HTTP_URL", "HTTP_URL").as_deref(),
+            Some("https://openapi.longportapp.cn")
+        );
+        assert!(optional_language_env(&config).unwrap().is_some());
+        assert_eq!(
+            optional_bool_env(&config, "LONGPORT_ENABLE_OVERNIGHT", "ENABLE_OVERNIGHT").unwrap(),
+            Some(true)
+        );
+
+        unsafe {
+            std::env::remove_var("LONGPORT_MAIN_HTTP_URL");
+            std::env::remove_var("LONGPORT_MAIN_LANGUAGE");
+            std::env::remove_var("LONGPORT_MAIN_ENABLE_OVERNIGHT");
+        }
     }
 
     #[test]
