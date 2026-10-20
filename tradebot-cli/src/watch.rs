@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Timelike, Utc, Weekday};
 use chrono_tz::Tz;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info, warn};
@@ -24,7 +24,7 @@ pub fn watch(
     let mut state = WatchState::load(source.clone())?;
     let poll_interval = Duration::from_secs(poll_seconds.max(1));
     let (_watcher, rx) = build_watcher(&source)?;
-    let mut pending_reload_at: Option<Instant> = None;
+    let mut pending_reload = PendingReload::default();
 
     info!(
         source = %source.display(),
@@ -39,12 +39,16 @@ pub fn watch(
 
     loop {
         let now = Instant::now();
-        let wait = next_watch_wait(poll_interval, pending_reload_at, now);
+        let wait = next_watch_wait(poll_interval, pending_reload.deadline, now);
         match rx.recv_timeout(wait) {
             Ok(Ok(event)) => {
                 if source.should_reload_for_event(&event) {
                     drain_ready_events(&rx);
-                    pending_reload_at = Some(Instant::now() + state.reload_debounce());
+                    pending_reload.schedule(
+                        Instant::now(),
+                        state.reload_debounce(),
+                        state.task_reload_delay(Utc::now(), poll_interval),
+                    );
                 }
             }
             Ok(Err(err)) => {
@@ -57,8 +61,11 @@ pub fn watch(
                 ));
             }
         }
-        if pending_reload_at.is_some_and(|deadline| Instant::now() >= deadline) {
-            pending_reload_at = None;
+        if pending_reload
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            pending_reload = PendingReload::default();
             state.reload_if_changed();
         }
         state.notify_task_list_confirm_if_due();
@@ -127,6 +134,9 @@ impl WatchSource {
     }
 
     fn should_reload_for_event(&self, event: &Event) -> bool {
+        if event.kind.is_access() {
+            return false;
+        }
         match self {
             Self::File(path) => {
                 let watch_root = path.parent().unwrap_or(path.as_path());
@@ -353,6 +363,35 @@ impl WatchState {
 
     fn reload_debounce(&self) -> Duration {
         Duration::from_secs(self.config.watch.reload_debounce_seconds)
+    }
+
+    fn task_reload_delay(&self, now: DateTime<Utc>, poll_interval: Duration) -> Option<Duration> {
+        let debounce = self.reload_debounce();
+        let reload_at = now + debounce + poll_interval;
+        let next_task_at = next_task_in_window(&self.config, now, reload_at)
+            .into_iter()
+            .chain(
+                self.source
+                    .load_snapshot()
+                    .ok()
+                    .and_then(|snapshot| next_task_in_window(&snapshot.config, now, reload_at)),
+            )
+            .min();
+        let delay = next_task_at.map(|task_at| {
+            (task_at - now)
+                .to_std()
+                .expect("upcoming task must not precede now")
+                .saturating_sub(poll_interval)
+                .min(debounce)
+        });
+        if let Some(delay) = delay.filter(|delay| *delay < debounce) {
+            info!(
+                source = %self.source.display(),
+                reload_delay_seconds = delay.as_secs_f64(),
+                "shortening config reload debounce for an upcoming scheduled task"
+            );
+        }
+        delay
     }
 
     fn log_scheduled_tasks(&self, verb: &str) {
@@ -745,6 +784,26 @@ fn latest_boundary(
     }
 }
 
+#[derive(Default)]
+struct PendingReload {
+    deadline: Option<Instant>,
+    task_deadline: Option<Instant>,
+}
+
+impl PendingReload {
+    fn schedule(&mut self, now: Instant, debounce: Duration, task_delay: Option<Duration>) {
+        if let Some(delay) = task_delay {
+            let deadline = now + delay;
+            self.task_deadline = Some(
+                self.task_deadline
+                    .map_or(deadline, |previous| previous.min(deadline)),
+            );
+        }
+        let deadline = now + debounce;
+        self.deadline = Some(self.task_deadline.map_or(deadline, |cap| deadline.min(cap)));
+    }
+}
+
 fn next_watch_wait(
     poll_interval: Duration,
     pending_reload_at: Option<Instant>,
@@ -823,6 +882,44 @@ fn schedule_matches_day(schedule: &TaskScheduleConfig, today: NaiveDate, weekday
     schedule.is_enabled_on(weekday)
 }
 
+fn next_task_in_window(
+    config: &AppConfig,
+    now: DateTime<Utc>,
+    reload_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let timezone = config
+        .defaults
+        .parse_timezone()
+        .expect("validated config must contain a valid timezone");
+    let first_day = now.with_timezone(&timezone).date_naive();
+    let last_day = reload_at.with_timezone(&timezone).date_naive();
+    first_day
+        .iter_days()
+        .take_while(|day| *day <= last_day)
+        .filter_map(|day| {
+            config
+                .tasks
+                .iter()
+                .filter_map(|task| {
+                    let schedule = task.schedule.as_ref()?;
+                    if !schedule_matches_day(schedule, day, day.weekday()) {
+                        return None;
+                    }
+                    let time = schedule.parse_time().ok()?;
+                    let scheduled_at = timezone.from_local_datetime(&day.and_time(time));
+                    scheduled_at
+                        .earliest()
+                        .into_iter()
+                        .chain(scheduled_at.latest())
+                        .map(|scheduled_at| scheduled_at.with_timezone(&Utc))
+                        .filter(|scheduled_at| *scheduled_at >= now && *scheduled_at <= reload_at)
+                        .min()
+                })
+                .min()
+        })
+        .min()
+}
+
 fn task_list_confirm_lead_seconds(config: &AppConfig) -> u32 {
     config
         .watch
@@ -880,13 +977,14 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    use chrono::{NaiveDate, NaiveTime, Weekday};
-    use notify::{Event, EventKind};
+    use chrono::{NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
+    use notify::{Event, EventKind, event::AccessKind};
     use trading_core::{AppConfig, ScheduleOverduePolicy, ScheduleWeekday, TaskScheduleConfig};
 
     use super::{
-        WatchSource, collect_toml_paths, load_config_dir, next_watch_wait, resolve_watch_path,
-        schedule_description, schedule_is_due, scheduled_task_counts, scheduled_task_descriptions,
+        PendingReload, WatchSource, WatchState, collect_toml_paths, load_config_dir,
+        next_task_in_window, next_watch_wait, resolve_watch_path, schedule_description,
+        schedule_is_due, scheduled_task_counts, scheduled_task_descriptions,
         task_list_confirm_is_due, task_list_confirm_window,
     };
 
@@ -1171,6 +1269,168 @@ weight = 1.0
         };
 
         assert!(source.should_reload_for_event(&event));
+    }
+
+    #[test]
+    fn reading_config_does_not_trigger_another_reload() {
+        let path = resolve_watch_path(PathBuf::from("config/oneshot-tasks/common.toml")).unwrap();
+        let event = Event {
+            kind: EventKind::Access(AccessKind::Open(notify::event::AccessMode::Read)),
+            paths: vec![path.clone()],
+            attrs: Default::default(),
+        };
+        assert!(!WatchSource::File(path.clone()).should_reload_for_event(&event));
+        assert!(!WatchSource::Dir(path.parent().unwrap().into()).should_reload_for_event(&event));
+    }
+
+    #[test]
+    fn task_reload_delay_shortens_debounce_before_current_or_edited_schedules() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 16, 13, 25, 0).unwrap();
+        let dir = temp_dir("reload-delay");
+        let path = dir.join("tasks.toml");
+        for (old_time, new_time, new_name, enabled, expected) in [
+            ("09:30", "21:30", "task-a", true, Duration::from_secs(295)),
+            ("09:30", "21:30", "task-b", true, Duration::from_secs(295)),
+            ("21:30", "22:00", "task-a", true, Duration::from_secs(295)),
+            ("21:30", "21:30", "task-a", false, Duration::from_secs(295)),
+            ("21:28", "21:30", "task-a", true, Duration::from_secs(175)),
+            ("21:30", "21:28", "task-a", true, Duration::from_secs(175)),
+            ("09:30", "21:35", "task-a", true, Duration::from_secs(595)),
+            (
+                "09:30",
+                "21:35:03",
+                "task-a",
+                true,
+                Duration::from_secs(598),
+            ),
+            (
+                "09:30",
+                "21:35:05",
+                "task-a",
+                true,
+                Duration::from_secs(600),
+            ),
+            ("09:30", "21:25:10", "task-a", true, Duration::from_secs(5)),
+            ("09:30", "21:25:05", "task-a", true, Duration::ZERO),
+            ("09:30", "21:25:03", "task-a", true, Duration::ZERO),
+            ("09:30", "22:00", "task-a", true, Duration::from_secs(600)),
+            ("09:30", "21:24", "task-a", true, Duration::from_secs(600)),
+            ("09:30", "21:30", "task-a", false, Duration::from_secs(600)),
+        ] {
+            let old =
+                sample_config("task-a", "broker_a", "Asia/Shanghai").replace("09:30", old_time);
+            fs::write(&path, old).unwrap();
+            let state = WatchState::load(WatchSource::File(path.clone())).unwrap();
+            let edited = sample_config(new_name, "broker_a", "Asia/Shanghai")
+                .replace("09:30", new_time)
+                .replace(
+                    "weekdays =",
+                    &format!("enabled = {enabled}, overdue_policy = \"skip\", weekdays ="),
+                );
+            fs::write(&path, edited).unwrap();
+            assert_eq!(
+                state
+                    .task_reload_delay(now, Duration::from_secs(5))
+                    .unwrap_or(state.reload_debounce()),
+                expected,
+                "{old_time} -> {new_time}, {new_name}, enabled={enabled}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_edited_config_keeps_normal_debounce_and_previous_config() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 16, 13, 25, 0).unwrap();
+        let dir = temp_dir("invalid-reload");
+        let path = dir.join("tasks.toml");
+        fs::write(&path, sample_config("task-a", "broker_a", "Asia/Shanghai")).unwrap();
+        let mut state = WatchState::load(WatchSource::File(path.clone())).unwrap();
+        fs::write(&path, "[[tasks]").unwrap();
+        assert_eq!(state.task_reload_delay(now, Duration::from_secs(5)), None);
+        state.reload_if_changed();
+        assert_eq!(state.config.tasks[0].name, "task-a");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn next_task_respects_dates_weekdays_and_midnight_in_config_timezone() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 16, 15, 55, 0).unwrap();
+        let reload_at = now + Duration::from_secs(600);
+        let mut config =
+            AppConfig::from_toml(&sample_config("task-a", "broker_a", "Asia/Shanghai")).unwrap();
+        let schedule = config.tasks[0].schedule.as_mut().unwrap();
+        schedule.time = "00:00".into();
+        schedule.date = Some("2026-03-17".into());
+        schedule.weekdays = vec![ScheduleWeekday::Tue];
+        assert_eq!(
+            next_task_in_window(&config, now, reload_at),
+            Some(Utc.with_ymd_and_hms(2026, 3, 16, 16, 0, 0).unwrap())
+        );
+
+        config.tasks[0].schedule.as_mut().unwrap().weekdays = vec![ScheduleWeekday::Mon];
+        assert_eq!(next_task_in_window(&config, now, reload_at), None);
+        let schedule = config.tasks[0].schedule.as_mut().unwrap();
+        schedule.weekdays.clear();
+        schedule.date = Some("2026-03-18".into());
+        assert_eq!(next_task_in_window(&config, now, reload_at), None);
+    }
+
+    #[test]
+    fn next_task_chooses_the_earliest_enabled_task() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 16, 1, 25, 0).unwrap();
+        let reload_at = now + Duration::from_secs(600);
+        let mut config =
+            AppConfig::from_toml(&sample_config("task-a", "broker_a", "Asia/Shanghai")).unwrap();
+        let mut earlier_task = config.tasks[0].clone();
+        earlier_task.name = "task-b".into();
+        earlier_task.schedule.as_mut().unwrap().time = "09:28".into();
+        config.tasks.push(earlier_task);
+        assert_eq!(
+            next_task_in_window(&config, now, reload_at),
+            Some(Utc.with_ymd_and_hms(2026, 3, 16, 1, 28, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn repeated_edits_reset_debounce_but_cannot_extend_the_task_deadline() {
+        let now = Instant::now();
+        let debounce = Duration::from_secs(600);
+        let mut pending = PendingReload::default();
+        pending.schedule(now, debounce, None);
+        assert_eq!(pending.deadline, Some(now + debounce));
+        assert_eq!(pending.task_deadline, None);
+
+        pending.schedule(now + Duration::from_secs(60), debounce, None);
+        assert_eq!(pending.deadline, Some(now + Duration::from_secs(660)));
+
+        pending.schedule(
+            now + Duration::from_secs(120),
+            debounce,
+            Some(Duration::from_secs(175)),
+        );
+        assert_eq!(pending.deadline, Some(now + Duration::from_secs(295)));
+        pending.schedule(
+            now + Duration::from_secs(240),
+            debounce,
+            Some(Duration::from_secs(55)),
+        );
+        assert_eq!(pending.deadline, Some(now + Duration::from_secs(295)));
+
+        // Even an incomplete edit must not discard the previously observed task deadline.
+        pending.schedule(now + Duration::from_secs(250), debounce, None);
+        assert_eq!(pending.deadline, Some(now + Duration::from_secs(295)));
+        pending.schedule(
+            now + Duration::from_secs(255),
+            debounce,
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(pending.deadline, Some(now + Duration::from_secs(260)));
+
+        let mut pending = PendingReload::default();
+        pending.schedule(now, debounce, Some(debounce));
+        pending.schedule(now + Duration::from_secs(60), debounce, None);
+        assert_eq!(pending.deadline, Some(now + debounce));
     }
 
     #[test]

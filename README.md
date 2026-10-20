@@ -71,6 +71,8 @@ The file-reload debounce is configurable under `watch.reload_debounce_seconds` a
 reload_debounce_seconds = 600
 ```
 
+The watcher caps each pending reload at one polling interval before the earliest upcoming enabled task in either the current config or the edited config (5 seconds by default). It temporarily shortens the debounce only when needed to meet this deadline. Further edits still reset the normal debounce, but cannot postpone loading beyond an already identified task deadline. If less than one polling interval remains, loading is immediate. For example, an edit at 21:25 for a 21:30 task reloads at 21:29:55 with the default settings. The configured debounce stays unchanged, and already overdue tasks still follow `overdue_policy`.
+
 Broker connectivity now comes from environment variables rather than inline broker settings:
 
 ```bash
