@@ -46,13 +46,12 @@ where
         .unwrap_or(false);
 
     let mut resolved = Vec::with_capacity(task.symbols.len());
-    for symbol in &task.symbols {
+    for symbol in task.order_symbols() {
         resolved.push((symbol, resolve(&symbol.instrument)?));
     }
 
     let weight_total: f64 = task
-        .symbols
-        .iter()
+        .order_symbols()
         .map(|symbol| symbol.weight.unwrap_or(0.0))
         .sum();
 

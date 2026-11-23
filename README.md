@@ -155,6 +155,8 @@ weight = 1.0
 
 Tasks override template fields when both are present. Arrays and nested tables are replaced wholesale, so a task can swap out `symbols`, `notify`, `schedule`, or `execution` without deep-merge rules.
 
+Set `quantity = 0` on a fixed-quantity symbol to skip it when placing orders. If every symbol has zero quantity, the task submits no orders.
+
 Task completion emails can be enabled with a task-level recipient list:
 
 ```toml

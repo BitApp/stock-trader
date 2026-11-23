@@ -1468,8 +1468,7 @@ fn sample_result_for_event(
     let symbols = if task.symbols.is_empty() {
         vec!["UNKNOWN".to_string()]
     } else {
-        task.symbols
-            .iter()
+        task.order_symbols()
             .map(|symbol| symbol.instrument.ticker.clone())
             .collect::<Vec<_>>()
     };

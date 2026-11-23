@@ -110,6 +110,14 @@ pub struct TaskConfig {
     pub symbols: Vec<SymbolTarget>,
 }
 
+impl TaskConfig {
+    pub fn order_symbols(&self) -> impl Iterator<Item = &SymbolTarget> {
+        self.symbols
+            .iter()
+            .filter(|symbol| symbol.quantity != Some(0))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WatchConfig {
     #[serde(default = "default_reload_debounce_seconds")]
@@ -410,7 +418,7 @@ impl AppConfig {
                 }
                 weight_sum += weight;
             }
-            if matches!(pricing, PricingSpec::Limit { .. }) {
+            if symbol.quantity != Some(0) && matches!(pricing, PricingSpec::Limit { .. }) {
                 let global_limit = match pricing {
                     PricingSpec::Limit { price } => *price,
                     _ => None,
@@ -656,7 +664,7 @@ fn validate_symbol_trade_constraints(task_name: &str, symbol: &SymbolTarget) -> 
         )));
     }
 
-    if let Some(quantity) = symbol.quantity {
+    if let Some(quantity) = symbol.quantity.filter(|&quantity| quantity != 0) {
         let quantity_step = symbol.quantity_step.unwrap_or(1);
         let min_quantity = align_up_to_step(symbol.min_quantity.unwrap_or(1), quantity_step)?;
         if quantity < min_quantity {

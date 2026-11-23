@@ -82,7 +82,11 @@ impl TradingEngine {
                         |resolved| broker.fetch_position(resolved),
                         |resolved| broker.fetch_quote(resolved),
                     )?;
-                    let placed = broker.place_orders(&orders)?;
+                    let placed = if orders.is_empty() {
+                        Vec::new()
+                    } else {
+                        broker.place_orders(&orders)?
+                    };
                     Ok(ExecutionResult {
                         task_name: task.name.clone(),
                         broker_name: task.broker.clone(),
@@ -185,7 +189,7 @@ impl TradingEngine {
         let mut placed_orders = Vec::new();
         let mut cancellations = Vec::new();
 
-        for (symbol, seed_order) in task.symbols.iter().zip(seed_orders.iter()) {
+        for (symbol, seed_order) in task.order_symbols().zip(&seed_orders) {
             let (mut symbol_orders, mut symbol_cancellations) =
                 self.execute_symbol_policy(task, symbol, seed_order, broker, execution)?;
             placed_orders.append(&mut symbol_orders);
@@ -590,6 +594,7 @@ mod tests {
         }
 
         fn place_orders(&self, orders: &[BrokerOrderRequest]) -> Result<Vec<OrderResult>> {
+            assert!(!orders.is_empty());
             Ok(orders
                 .iter()
                 .map(|order| OrderResult {
@@ -694,6 +699,7 @@ mod tests {
         }
 
         fn resolve_instrument(&self, instrument: &InstrumentRef) -> Result<ResolvedInstrument> {
+            assert_ne!(instrument.ticker, "AZO");
             Ok(ResolvedInstrument {
                 ticker: instrument.ticker.clone(),
                 market: instrument.market,
@@ -894,6 +900,47 @@ mod tests {
     }
 
     #[test]
+    fn run_place_task_skips_zero_quantity_symbols() {
+        let mut config = AppConfig::from_toml(
+            r#"
+[brokers.paper]
+kind = "mock"
+
+[[tasks]]
+name = "rebalance"
+broker = "paper"
+side = "buy"
+pricing = { kind = "limit" }
+
+[[tasks.symbols]]
+ticker = "AZO"
+market = "us"
+quantity = 0
+
+[[tasks.symbols]]
+ticker = "ORLY"
+market = "us"
+quantity = 33
+limit_price = 100.0
+"#,
+        )
+        .unwrap();
+
+        let result = test_engine(config.tasks[0].clone())
+            .run_task("rebalance")
+            .unwrap();
+        assert_eq!(result.orders.len(), 1);
+        assert_eq!(result.orders[0].raw_metadata["symbol"], "ORLY.US");
+
+        config.tasks[0].symbols.truncate(1);
+        config.validate().unwrap();
+        let result = test_engine(config.tasks.remove(0))
+            .run_task("rebalance")
+            .unwrap();
+        assert!(result.orders.is_empty());
+    }
+
+    #[test]
     fn run_place_task_retries_with_cancel_replace_policy() {
         let state = Arc::new(Mutex::new(RetryState::default()));
         let mut registry = BrokerRegistry::new();
@@ -901,7 +948,7 @@ mod tests {
             state: state.clone(),
         });
 
-        let task = TaskConfig {
+        let mut task = TaskConfig {
             name: "retry".into(),
             broker: "paper".into(),
             action: TaskAction::Place,
@@ -939,6 +986,10 @@ mod tests {
                 broker_options: BTreeMap::new(),
             }],
         };
+        let mut skipped = task.symbols[0].clone();
+        skipped.instrument.ticker = "AZO".into();
+        skipped.quantity = Some(0);
+        task.symbols.insert(0, skipped);
 
         let config = AppConfig {
             defaults: DefaultsConfig::default(),
